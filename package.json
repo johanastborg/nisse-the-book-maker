@@ -1,0 +1,27 @@
+{
+  "name": "nisse-the-book-maker",
+  "version": "1.0.0",
+  "description": "Lovable-style AI Multi-Agent Academic Book Publishing System with Typst Compiler",
+  "scripts": {
+    "dev": "concurrently -n backend,frontend -c magenta,cyan \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "./venv/bin/uvicorn main:app --app-dir backend --host 0.0.0.0 --port 8000 --reload",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "setup": "python3 -m venv venv && ./venv/bin/pip install -r backend/requirements.txt && cd frontend && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "keywords": [
+    "typst",
+    "gemini",
+    "ai-agents",
+    "academic-publishing",
+    "springer",
+    "latex",
+    "nextjs",
+    "fastapi"
+  ],
+  "author": "Antigravity & Johan Astborg",
+  "license": "MIT"
+}
