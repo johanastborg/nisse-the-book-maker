@@ -71,7 +71,19 @@ User Prompt / Academic Topic & Publishing Parameters
 npm run setup
 ```
 
-### 3. Run the Development Server
+### 3. Environment Configuration
+Create a `.env` file in the root directory (or in `backend/`) containing your Gemini API key:
+
+```bash
+# .env
+GEMINI_API_KEY="your-gemini-api-key-here"
+# or
+GOOGLE_API_KEY="your-gemini-api-key-here"
+```
+
+> **Note:** You can also configure the Gemini API key directly in the web UI Settings modal at any time.
+
+### 4. Run the Development Server
 ```bash
 npm run dev
 ```

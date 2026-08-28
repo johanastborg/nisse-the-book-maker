@@ -51,6 +51,16 @@ def sanitize_typst(text: str) -> str:
     text = text.replace("ddot(", "dot.double(")
     text = text.replace(r"\langle", "chevron.l")
     text = text.replace(r"\rangle", "chevron.r")
+    text = text.replace("langle", "chevron.l")
+    text = text.replace("rangle", "chevron.r")
+    text = text.replace(r"\left(", "(")
+    text = text.replace(r"\right)", ")")
+    text = text.replace(r"\left[", "[")
+    text = text.replace(r"\right]", "]")
+    text = text.replace(r"\left\{", "{")
+    text = text.replace(r"\right\}", "}")
+    text = text.replace(r"\propto", "prop")
+    text = text.replace("propto", "prop")
     text = text.replace(r"\cdot", "dot.c")
     text = re.sub(r"(\w)\s+dot\s+(\w)", r"\1 dot.c \2", text)
     text = text.replace(r"\pm", "plus.minus")
@@ -58,6 +68,12 @@ def sanitize_typst(text: str) -> str:
     text = text.replace(r"\otimes", "times.o")
     text = text.replace("times.circle", "times.o")
     text = text.replace(r"\oplus", "plus.o")
+    
+    # Convert markdown angle-bracket URLs and DOIs (<https://...>) to Typst #link("...")
+    text = re.sub(r'<(https?://[^>\s]+)>', r'#link("\1")', text)
+    text = re.sub(r'<(doi:[^>\s]+)>', r'#link("\1")', text)
+    text = re.sub(r'<([a-zA-Z0-9_\-\.]+@[a-zA-Z0-9_\-\.]+)>', r'#link("mailto:\1")', text)
+
     # Convert markdown headers to Typst headers (e.g. ## Title -> == Title)
     text = re.sub(r"^######\s+(.+)$", r"====== \1", text, flags=re.MULTILINE)
     text = re.sub(r"^#####\s+(.+)$", r"===== \1", text, flags=re.MULTILINE)
@@ -70,24 +86,46 @@ def sanitize_typst(text: str) -> str:
     text = text.replace("ker(", '"ker"(')
     text = text.replace("dim(", '"dim"(')
 
-    # Balance unclosed math $ delimiters
-    dollar_count = text.count("$")
-    if dollar_count % 2 != 0:
-        text += "\n$\n"
+    # Line-by-line math balance: ensure unclosed inline math on a line is closed on that line
+    lines = text.split('\n')
+    fixed_lines = []
+    in_block_math = False
+    for line in lines:
+        s = line.strip()
+        if s == '$':
+            in_block_math = not in_block_math
+            fixed_lines.append(line)
+            continue
+        if not in_block_math and line.count('$') % 2 != 0:
+            line += ' $'
+        fixed_lines.append(line)
+    text = '\n'.join(fixed_lines)
 
-    # Balance unclosed brackets [ vs ]
-    open_sq = text.count("[")
-    close_sq = text.count("]")
-    if open_sq > close_sq:
-        text += "\n" + ("]\n" * (open_sq - close_sq))
+    # Stack-based delimiter balancing for brackets and parentheses
+    stack = []
+    in_math = False
+    for c in text:
+        if c == '$':
+            in_math = not in_math
+        elif not in_math:
+            if c in '([':
+                stack.append(c)
+            elif c == ')' and stack and stack[-1] == '(':
+                stack.pop()
+            elif c == ']' and stack and stack[-1] == '[':
+                stack.pop()
 
-    # Balance unclosed parentheses ( vs )
-    open_p = text.count("(")
-    close_p = text.count(")")
-    if open_p > close_p:
-        text += ")" * (open_p - close_p)
+    res = text
+    if in_math:
+        res += '\n$\n'
+    while stack:
+        b = stack.pop()
+        if b == '[':
+            res += '\n]\n'
+        elif b == '(':
+            res += ')'
     
-    return text.strip()
+    return res.strip()
 
 
 def _load_env():
@@ -239,7 +277,47 @@ class BookEngine:
                             temperature=0.3,
                         ),
                     )
-                return sanitize_typst(response.text)
+                
+                raw_draft = response.text
+                sanitized_draft = sanitize_typst(raw_draft)
+                
+                # Verify individual chapter compiles
+                test_header = f"""#import "backend/templates/springer.typ": book, theorem, definition, lemma, proposition, proof, example, remark, chapter-abstract, hbar
+#show: book.with(title: "{blueprint.title}", author: "{blueprint.author}", affiliation: "Inst", series: "Series", discipline: "Field", preface: [], notation_conventions: [])
+
+{sanitized_draft}
+"""
+                test_tmp = os.path.join(WORKSPACE_ROOT, f"_test_ch_{uuid.uuid4().hex[:6]}.typ")
+                try:
+                    with open(test_tmp, "w", encoding="utf-8") as f:
+                        f.write(test_header)
+                    typst.compile(test_tmp, root=WORKSPACE_ROOT)
+                    return sanitized_draft
+                except Exception as comp_e:
+                    print(f"[WriterAgent] Chapter {chapter.number} had syntax nuance ({comp_e}). Applying second healing pass.")
+                    def _fix_callout_title(m):
+                        t = m.group(2).replace('"', "'")
+                        return f'#{m.group(1)}(title: "{t}")['
+                    repaired = re.sub(r'#([a-zA-Z0-9_\-]+)\s*\(\s*title:\s*\"(.*?)\"\s*\)\s*\[', _fix_callout_title, sanitized_draft)
+                    repaired = sanitize_typst(repaired)
+                    
+                    # Test re-compiled draft
+                    try:
+                        with open(test_tmp, "w", encoding="utf-8") as f:
+                            f.write(f"""#import "backend/templates/springer.typ": book, theorem, definition, lemma, proposition, proof, example, remark, chapter-abstract, hbar
+#show: book.with(title: "{blueprint.title}", author: "{blueprint.author}", affiliation: "Inst", series: "Series", discipline: "Field", preface: [], notation_conventions: [])
+
+{repaired}
+""")
+                        typst.compile(test_tmp, root=WORKSPACE_ROOT)
+                        return repaired
+                    except Exception as second_comp_e:
+                        print(f"[WriterAgent] Chapter {chapter.number} second pass failed ({second_comp_e}). Using verified dynamic synthesizer.")
+                        return self._synthesize_chapter(blueprint, chapter, rigor_level)
+                finally:
+                    if os.path.exists(test_tmp):
+                        os.remove(test_tmp)
+
             except Exception as e:
                 print(f"[WriterAgent] Chapter {chapter.number} GenAI call failed: {e}. Synthesizing academic chapter.")
 
@@ -265,12 +343,17 @@ class BookEngine:
                 Perform editorial normalization:
                 1. Verify consistent equation notation across all chapters.
                 2. Check cross-chapter references and terminology alignment.
-                3. Compile a normalized, comprehensive Springer-format bibliography with 8+ seminal references.
+                3. Compile a normalized, comprehensive Springer-format bibliography with 8+ seminal references as a Typst numbered list (+ Author (Year). Title...).
                 
+                IMPORTANT: For "bibliography_typst", output ONLY a raw Typst numbered list using `+ `, like:
+                + Author, A., & Coauthor, B. (Year). *Title of Book*. Publisher.
+                + Author, C. (Year). Title of Article. *Journal Name*, 1(2), 100-120.
+                Do NOT output #let, code arrays, dictionaries, or angle brackets around URLs.
+
                 Return JSON with:
                 - "coherence_score": (int 1-100)
                 - "editorial_notes": (list of string feedback)
-                - "bibliography_typst": (string of formatted Typst bibliography entries)
+                - "bibliography_typst": (string of formatted Typst numbered bibliography entries)
                 """
                 response = client.models.generate_content(
                     model="gemini-2.5-flash",
@@ -282,10 +365,15 @@ class BookEngine:
                 )
                 raw_text = response.text
                 try:
-                    return json.loads(raw_text)
+                    res = json.loads(raw_text)
                 except Exception:
                     clean_text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw_text)
-                    return json.loads(clean_text, strict=False)
+                    res = json.loads(clean_text, strict=False)
+                
+                bib = res.get("bibliography_typst", "")
+                if not bib or "#let" in bib or "+" not in bib:
+                    res["bibliography_typst"] = self._generate_bibliography_typst(blueprint)
+                return res
             except Exception as e:
                 print(f"[ReviewerAgent] GenAI call failed: {e}. Using deterministic editorial normalization.")
 
@@ -313,40 +401,47 @@ class BookEngine:
         """Assembles the complete master Typst file using the Springer template."""
         template_rel_path = "backend/templates/springer.typ"
         
+        def clean_header_str(s: Any) -> str:
+            return str(s or "").replace('"', "'").strip()
+
         preface_content = blueprint.preface if blueprint.preface else f"""
-This monograph presents an axiomatic, pedagogical exposition of *{blueprint.title}*.
-The primary objective is to bridge the conceptual gap between introductory graduate coursework and current research literature in {blueprint.discipline}.
+This monograph presents an axiomatic, pedagogical exposition of *{clean_header_str(blueprint.title)}*.
+The primary objective is to bridge the conceptual gap between introductory graduate coursework and current research literature in {clean_header_str(blueprint.discipline)}.
 Each chapter develops the theoretical framework from foundational principles, followed by complete derivations and rigorous theorems.
 """
 
         notation_content = blueprint.notation_conventions if blueprint.notation_conventions else """
 We adhere to standard international conventions for theoretical physics and mathematics:
 - Metric tensor signature $(- , + , + , +)$ in Lorentzian spacetime manifolds.
-- Greek indices $mu, nu, rho in {0, 1, 2, 3}$ denote spacetime dimensions.
-- Roman indices $i, j, k in {1, 2, 3}$ indicate spatial coordinates.
+- Greek indices $mu, nu, rho$ denote spacetime dimensions.
+- Roman indices $i, j, k$ indicate spatial coordinates.
 - Summation convention: Repeated indices imply summation over the full coordinate range.
 """
+        # Ensure preface, notation, and bibliography are sanitized
+        clean_preface = sanitize_typst(preface_content)
+        clean_notation = sanitize_typst(notation_content)
+        clean_bib = sanitize_typst(bibliography_typst) if bibliography_typst else self._generate_bibliography_typst(blueprint)
 
         doc_header = f"""// Master Typst Document generated by Nisse Book Maker
-// Title: {blueprint.title}
-// Author: {blueprint.author}
+// Title: {clean_header_str(blueprint.title)}
+// Author: {clean_header_str(blueprint.author)}
 
 #import "{template_rel_path}": book, theorem, definition, lemma, proposition, proof, example, remark, chapter-abstract, hbar
 
 #show: book.with(
-  title: "{blueprint.title}",
-  subtitle: "{blueprint.subtitle}",
-  author: "{blueprint.author}",
-  affiliation: "{blueprint.affiliation}",
-  series: "{blueprint.series}",
-  discipline: "{blueprint.discipline}",
-  edition: "{blueprint.edition}",
-  dedication: "{blueprint.dedication}",
+  title: "{clean_header_str(blueprint.title)}",
+  subtitle: "{clean_header_str(blueprint.subtitle)}",
+  author: "{clean_header_str(blueprint.author)}",
+  affiliation: "{clean_header_str(blueprint.affiliation)}",
+  series: "{clean_header_str(blueprint.series)}",
+  discipline: "{clean_header_str(blueprint.discipline)}",
+  edition: "{clean_header_str(blueprint.edition)}",
+  dedication: "{clean_header_str(blueprint.dedication)}",
   preface: [
-{preface_content}
+{clean_preface}
   ],
   notation_conventions: [
-{notation_content}
+{clean_notation}
   ]
 )
 
@@ -362,7 +457,7 @@ We adhere to standard international conventions for theoretical physics and math
 #line(length: 100%, stroke: 0.5pt + rgb("#cbd5e1"))
 #v(1em)
 
-{bibliography_typst}
+{clean_bib}
 """
         return doc_header + body_content + bib_section
 
@@ -542,10 +637,21 @@ We adhere to standard international conventions for theoretical physics and math
         typst_path = os.path.join(book_folder, "master.typ")
         meta_path = os.path.join(book_folder, "metadata.json")
 
-        with open(typst_path, "w", encoding="utf-8") as f:
-            f.write(master_typst)
+        try:
+            pdf_bytes = self.compile_document(master_typst, pdf_path)
+        except Exception as comp_err:
+            print(f"[BookEngine] Compilation error: {comp_err}. Attempting fallback compilation...")
+            # Emergency fallback: synthesize clean chapters for broken sections
+            clean_drafts = [self._synthesize_chapter(blueprint, ch, request.rigor_level) for ch in blueprint.chapters]
+            master_typst = self.assemble_master_document(
+                blueprint=blueprint,
+                chapter_drafts=clean_drafts,
+                bibliography_typst=review_result.get("bibliography_typst", "")
+            )
+            with open(typst_path, "w", encoding="utf-8") as f:
+                f.write(master_typst)
+            pdf_bytes = self.compile_document(master_typst, pdf_path)
 
-        pdf_bytes = self.compile_document(master_typst, pdf_path)
         compile_duration_ms = int((time.time() - t0) * 1000)
 
         # Estimate page count from PDF size or typst query
@@ -1006,13 +1112,26 @@ Let $cal(X) = L^2(bb(R)^n)$ represent the square-integrable state space. Evaluat
     def _generate_bibliography_typst(self, blueprint: BookBlueprint) -> str:
         """Generates formatted academic bibliography in Typst."""
         if blueprint.bibliography_seeds:
-            return "\n\n".join(blueprint.bibliography_seeds)
+            items = []
+            for seed in blueprint.bibliography_seeds:
+                seed_clean = re.sub(r'<(https?://[^>\s]+)>', r'#link("\1")', seed)
+                if not seed_clean.startswith("+"):
+                    items.append(f"+ {seed_clean}")
+                else:
+                    items.append(seed_clean)
+            return "\n\n".join(items)
+
         bib_items = [
-            f'1. Neumann, N. (2026). *Monographs in {blueprint.discipline}*. Springer Nature.',
-            '2. Hawking, S. W., & Ellis, G. F. R. (1973). *The Large Scale Structure of Space-Time*. Cambridge University Press.',
-            '3. Nielsen, M. A., & Chuang, I. L. (2010). *Quantum Computation and Quantum Information*. Cambridge University Press.',
-            '4. Bronstein, M. M., et al. (2021). *Geometric Deep Learning*. arXiv:2104.13478.',
-            '5. Rudin, W. (1991). *Functional Analysis*. McGraw-Hill Science.'
+            f'+ Neumann, N. (2026). *Monographs in {blueprint.discipline}*. Springer Nature.',
+            '+ Hawking, S. W., & Ellis, G. F. R. (1973). *The Large Scale Structure of Space-Time*. Cambridge University Press.',
+            '+ Nielsen, M. A., & Chuang, I. L. (2010). *Quantum Computation and Quantum Information*. Cambridge University Press.',
+            '+ Bronstein, M. M., et al. (2021). Geometric Deep Learning: Grids, Groups, Graphs, Geodesics, and Gauges. *arXiv preprint*, arXiv:2104.13478.',
+            '+ Rudin, W. (1991). *Functional Analysis*. McGraw-Hill Science.',
+            '+ De Groot, S. R., & Mazur, P. (1984). *Non-Equilibrium Thermodynamics*. Dover Publications.',
+            '+ Zwanzig, R. (2001). *Nonequilibrium Statistical Mechanics*. Oxford University Press.',
+            '+ Ramaswamy, S. (2010). The mechanics and statistics of active matter. *Annual Review of Condensed Matter Physics*, 1(1), 323–345.',
+            '+ Marchetti, M. C., et al. (2013). Hydrodynamics of soft active matter. *Reviews of Modern Physics*, 85(3), 1143–1189.',
+            '+ Cates, M. E., & Tailleur, J. (2015). Motility-induced phase separation. *Annual Review of Condensed Matter Physics*, 6, 219–244.'
         ]
         return "\n\n".join(bib_items)
 
