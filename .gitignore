@@ -149,6 +149,8 @@ activemq-data/
 
 # Environments
 .env
+.env.local
+backend/.env
 .envrc
 .venv
 env/
@@ -156,6 +158,12 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Typst documents and generated storage
+*.typ
+!backend/templates/*.typ
+backend/storage/books/book_*
+!backend/storage/books/book_showcase_*
 
 # Spyder project settings
 .spyderproject

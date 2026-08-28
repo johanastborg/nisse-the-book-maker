@@ -20,12 +20,16 @@ interface PromptStudioProps {
   onStartGeneration: (req: GenerateBookRequest) => void;
   presets: PresetTopic[];
   isGenerating: boolean;
+  onOpenSettings?: () => void;
+  hasApiKey?: boolean;
 }
 
 export const PromptStudio: React.FC<PromptStudioProps> = ({
   onStartGeneration,
   presets,
   isGenerating,
+  onOpenSettings,
+  hasApiKey = false,
 }) => {
   const [topic, setTopic] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -74,9 +78,24 @@ export const PromptStudio: React.FC<PromptStudioProps> = ({
 
       {/* Hero Header */}
       <div className="text-center space-y-4 mb-10">
-        <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs font-semibold tracking-wide shadow-sm">
-          <Sparkles className="h-3.5 w-3.5 text-amber-400" />
-          <span>Autonomous Multi-Agent Academic Publishing Pipeline</span>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-500/10 border border-amber-500/25 text-amber-300 text-xs font-semibold tracking-wide shadow-sm">
+            <Sparkles className="h-3.5 w-3.5 text-amber-400" />
+            <span>Autonomous Multi-Agent Academic Publishing Pipeline</span>
+          </div>
+
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border transition-colors ${
+              hasApiKey
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-amber-500/40 hover:text-amber-300'
+            }`}
+          >
+            <div className={`h-2 w-2 rounded-full ${hasApiKey ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
+            <span>{hasApiKey ? 'Gemini 2.5 Live Agents Connected' : 'Engine: Dynamic Monograph Synthesizer (Click to add API Key)'}</span>
+          </button>
         </div>
 
         <h1 className="text-3xl sm:text-5xl lg:text-6xl font-extrabold text-slate-100 tracking-tight font-['Outfit']">

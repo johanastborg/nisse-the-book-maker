@@ -101,7 +101,7 @@ export default function HomePage() {
       ...req,
       api_key: userSettings.geminiApiKey || undefined,
       model_choice: userSettings.selectedModel || 'gemini-2.5-pro',
-      use_simulation: userSettings.useSimulation || (!userSettings.geminiApiKey && !req.api_key),
+      use_simulation: !!userSettings.useSimulation,
     };
 
     setIsGenerating(true);
@@ -222,6 +222,8 @@ export default function HomePage() {
             onStartGeneration={handleStartGeneration}
             presets={presets}
             isGenerating={isGenerating}
+            onOpenSettings={() => setIsSettingsOpen(true)}
+            hasApiKey={typeof window !== 'undefined' && !!getStoredSettings().geminiApiKey}
           />
         )}
 

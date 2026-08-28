@@ -51,10 +51,64 @@ def sanitize_typst(text: str) -> str:
     text = text.replace("ddot(", "dot.double(")
     text = text.replace(r"\langle", "chevron.l")
     text = text.replace(r"\rangle", "chevron.r")
+    text = text.replace(r"\cdot", "dot.c")
+    text = re.sub(r"(\w)\s+dot\s+(\w)", r"\1 dot.c \2", text)
     text = text.replace(r"\pm", "plus.minus")
     text = text.replace(r"\mp", "minus.plus")
+    text = text.replace(r"\otimes", "times.o")
+    text = text.replace("times.circle", "times.o")
+    text = text.replace(r"\oplus", "plus.o")
+    # Convert markdown headers to Typst headers (e.g. ## Title -> == Title)
+    text = re.sub(r"^######\s+(.+)$", r"====== \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^#####\s+(.+)$", r"===== \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^####\s+(.+)$", r"==== \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^###\s+(.+)$", r"=== \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^##\s+(.+)$", r"== \1", text, flags=re.MULTILINE)
+    text = re.sub(r"^#\s+([A-Za-z0-9\"'].*)$", r"= \1", text, flags=re.MULTILINE)
+
+    text = text.replace("Hom(", '"Hom"(')
+    text = text.replace("ker(", '"ker"(')
+    text = text.replace("dim(", '"dim"(')
+
+    # Balance unclosed math $ delimiters
+    dollar_count = text.count("$")
+    if dollar_count % 2 != 0:
+        text += "\n$\n"
+
+    # Balance unclosed brackets [ vs ]
+    open_sq = text.count("[")
+    close_sq = text.count("]")
+    if open_sq > close_sq:
+        text += "\n" + ("]\n" * (open_sq - close_sq))
+
+    # Balance unclosed parentheses ( vs )
+    open_p = text.count("(")
+    close_p = text.count(")")
+    if open_p > close_p:
+        text += ")" * (open_p - close_p)
     
     return text.strip()
+
+
+def _load_env():
+    """Load environment variables from .env files if present."""
+    for env_path in [
+        os.path.join(WORKSPACE_ROOT, ".env"),
+        os.path.join(WORKSPACE_ROOT, ".env.local"),
+        os.path.join(os.path.dirname(__file__), ".env"),
+    ]:
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            os.environ[k.strip()] = v.strip().strip('"').strip("'")
+            except Exception as e:
+                print(f"[BookEngine] Could not read env from {env_path}: {e}")
+
+_load_env()
 
 
 class BookEngine:
@@ -64,6 +118,7 @@ class BookEngine:
 
     def _get_genai_client(self, api_key: Optional[str] = None):
         """Initialize Google GenAI client with key from request or environment."""
+        _load_env()
         key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not key:
             return None
@@ -166,13 +221,24 @@ class BookEngine:
                 - Provide complete mathematical derivations. DO NOT summarize, hand-wave, or leave "left as an exercise to the reader".
                 - Write high-density, authoritative academic prose.
                 """
-                response = client.models.generate_content(
-                    model="gemini-2.5-pro",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.3,
-                    ),
-                )
+                # Use fast, powerful gemini-2.5-flash
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.3,
+                        ),
+                    )
+                except Exception as inner_e:
+                    print(f"[WriterAgent] Trying fallback model: {inner_e}")
+                    response = client.models.generate_content(
+                        model="gemini-3.1-pro-preview",
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.3,
+                        ),
+                    )
                 return sanitize_typst(response.text)
             except Exception as e:
                 print(f"[WriterAgent] Chapter {chapter.number} GenAI call failed: {e}. Synthesizing academic chapter.")
@@ -214,7 +280,12 @@ class BookEngine:
                         temperature=0.2,
                     ),
                 )
-                return json.loads(response.text)
+                raw_text = response.text
+                try:
+                    return json.loads(raw_text)
+                except Exception:
+                    clean_text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw_text)
+                    return json.loads(clean_text, strict=False)
             except Exception as e:
                 print(f"[ReviewerAgent] GenAI call failed: {e}. Using deterministic editorial normalization.")
 
@@ -300,14 +371,37 @@ We adhere to standard international conventions for theoretical physics and math
         typst_source: str,
         output_pdf_path: str
     ) -> bytes:
-        """Compiles Typst source code to PDF with sub-second performance."""
-        # Write temporary source file inside workspace root so Typst can resolve imports
+        """Compiles Typst source code to PDF with sub-second performance and auto-repair."""
         temp_src_path = os.path.join(WORKSPACE_ROOT, f"_temp_compile_{uuid.uuid4().hex[:8]}.typ")
         try:
             with open(temp_src_path, "w", encoding="utf-8") as f:
                 f.write(typst_source)
             
-            pdf_bytes = typst.compile(temp_src_path, root=WORKSPACE_ROOT)
+            try:
+                pdf_bytes = typst.compile(temp_src_path, root=WORKSPACE_ROOT)
+            except Exception as first_err:
+                print(f"[TypstCompiler] Initial compilation failed: {first_err}. Attempting auto-repair pass...")
+                # Auto-repair pass: sanitize again and balance delimiters
+                repaired_source = sanitize_typst(typst_source)
+                
+                # Check for unclosed square brackets across entire document
+                open_brackets = repaired_source.count("[")
+                close_brackets = repaired_source.count("]")
+                if open_brackets > close_brackets:
+                    repaired_source += "\n" + ("]\n" * (open_brackets - close_brackets))
+
+                with open(temp_src_path, "w", encoding="utf-8") as f:
+                    f.write(repaired_source)
+                
+                try:
+                    pdf_bytes = typst.compile(temp_src_path, root=WORKSPACE_ROOT)
+                except Exception as second_err:
+                    print(f"[TypstCompiler] Auto-repair failed: {second_err}. Fallback to robust normalized source.")
+                    # Final safe normalization fallback: strip any unescaped loose delimiters
+                    safe_source = re.sub(r"#([a-zA-Z0-9_\-]+)\s*\((.*?)\)\s*\[", r"#\1(\2) [", repaired_source)
+                    with open(temp_src_path, "w", encoding="utf-8") as f:
+                        f.write(safe_source)
+                    pdf_bytes = typst.compile(temp_src_path, root=WORKSPACE_ROOT)
             
             # Save output PDF
             os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
@@ -577,167 +671,172 @@ We adhere to standard international conventions for theoretical physics and math
     # =========================================================================
 
     def _synthesize_blueprint(self, request: GenerateBookRequest) -> BookBlueprint:
-        """Synthesizes structured blueprints based on topic classification."""
-        topic_lower = request.topic.lower()
+        """Synthesizes structured blueprints dynamically for ANY topic."""
+        topic = request.topic.strip()
+        topic_lower = topic.lower()
 
-        if "quantum" in topic_lower or "qubit" in topic_lower or "information" in topic_lower:
-            return BookBlueprint(
-                title=f"Quantum Information & Fault-Tolerant Architectures",
-                subtitle="Algebraic Foundations of Stabilizer Codes, Surface Lattices, and Quantum Supremacy",
-                author=request.author or "Prof. J. Preskill & P. Shor",
-                affiliation=request.affiliation or "Institute for Quantum Information & Physics",
-                series=request.series or "Graduate Texts in Contemporary Physics",
-                discipline="Quantum Information Science",
-                target_audience=request.audience or "Graduate Students and Quantum Computing Researchers",
-                dedication="Dedicated to the pioneers of quantum coherence and algebraic fault-tolerance.",
-                preface="This textbook offers an axiomatic formulation of quantum error correction, fault-tolerant threshold theorems, and holographic tensor networks.",
-                notation_conventions="Hilbert space $cal(H)_2^(times n)$; Pauli group $cal(G)_n = {plus.minus 1, plus.minus i} times {I, X, Y, Z}^(times n)$; computational basis $|0 angle, |1 angle$.",
-                chapters=[
-                    ChapterOutline(
-                        number=1,
-                        title="Hilbert Spaces, Density Operators, and Quantum Entanglement",
-                        abstract="We formulate the mathematical geometry of quantum states, von Neumann entropy, partial trace operations, and entanglement monotonicity under LOCC operations.",
-                        sections=[
-                            SectionOutline(title="Postulates of Quantum Mechanics & CPTP Maps", key_points=["State vectors and density matrices", "Completely Positive Trace-Preserving maps", "Kraus representation theorem"], equations_needed=["rho = sum_i p_i |psi_i chevron.r chevron.l psi_i|", "cal(E)(rho) = sum_k E_k rho E_k^dagger"]),
-                            SectionOutline(title="Quantum Entropy and the Subadditivity Theorem", key_points=["Von Neumann entropy", "Strong subadditivity", "Quantum mutual information"], equations_needed=["S(rho) = - tr(rho log_2 rho)", "S(A B C) + S(B) <= S(A B) + S(B C)"]),
-                            SectionOutline(title="Bell Inequalities and Quantum Nonlocality", key_points=["CHSH inequality", "Tsirelson bound", "Quantum teleportation protocol"], equations_needed=["|chevron.l B_(\"CHSH\") chevron.r| <= 2 sqrt(2)"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=2,
-                        title="The Pauli Group and Stabilizer Quantum Error Correction",
-                        abstract="This chapter establishes the algebraic structure of stabilizer codes, symplectic inner products over finite fields $bb(F)_2$, and the Knill-Laflamme error-correction criterion.",
-                        sections=[
-                            SectionOutline(title="The N-Qubit Pauli Group and Symplectic Geometry", key_points=["Commutation relations", "Symplectic isomorphism", "Isotropic subspaces"], equations_needed=["cal(S) = chevron.l g_1, g_2, dots, g_(n-k) chevron.r", "[g_i, g_j] = 0"]),
-                            SectionOutline(title="Knill-Laflamme Conditions for Error Discretization", key_points=["Orthogonal projectors", "Error syndromes", "Recovery maps"], equations_needed=["P E_a^dagger E_b P = C_(a b) P"]),
-                            SectionOutline(title="The 7-Qubit Steane Code and CSS Architecture", key_points=["Dual classical linear codes", "Transversal Clifford operations"], equations_needed=["|0_L chevron.r = 1/sqrt(8) sum_(c in C^perp) |c chevron.r"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=3,
-                        title="Topological Surface Codes and Anyonic Excitations",
-                        abstract="We analyze the Kitaev toric code on 2D lattices, homology classes of topological defects, and fault-tolerant decoding via minimum-weight perfect matching.",
-                        sections=[
-                            SectionOutline(title="The Kitaev Toric Code Hamiltonian", key_points=["Star operators", "Plaquette operators", "Ground state degeneracy"], equations_needed=["H = - J_e sum_s A_s - J_m sum_p B_p", "A_s = product_(i in s) X_i, quad B_p = product_(j in p) Z_j"]),
-                            SectionOutline(title="Braiding Statistics and Anyonic Ground States", key_points=["Abelian anyons", "Topological quantum memory", "Homology cycles"], equations_needed=["gamma = ln(sqrt(2))"]),
-                            SectionOutline(title="Threshold Theorems and MWPM Syndrome Decoding", key_points=["Syndrome graph", "Edmonds blossom algorithm", "Error threshold"], equations_needed=["p_(\"th\") approx 10.9%"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=4,
-                        title="Fault-Tolerant Gates and Magic State Distillation",
-                        abstract="We prove the Eastin-Knill theorem prohibiting universal transversal gate sets and construct magic state distillation protocols for universal quantum computation.",
-                        sections=[
-                            SectionOutline(title="The Eastin-Knill No-Go Theorem", key_points=["Continuous Lie symmetries", "Transversal gates", "Algebraic proof"], equations_needed=["U_L in cal(C)_k"]),
-                            SectionOutline(title="Bravyi-Kitaev Magic State Distillation", key_points=["T-gates", "15-to-1 distillation routine", "Resource overhead scaling"], equations_needed=["|T chevron.r = cos(pi/8)|0 chevron.r + sin(pi/8)|1 chevron.r", "epsilon_(\"out\") = 35 epsilon_(\"in\")^3"]),
-                            SectionOutline(title="Lattice Surgery and Fault-Tolerant Compilers", key_points=["Merge and split operations", "Spacetime braid diagrams", "Hardware scaling"], equations_needed=["N_(\"phys\") = cal(O)(d^2 N_(\"log\"))"])
-                        ]
-                    )
-                ]
-            )
+        # Clean title & generate subtitle
+        clean_title = topic
+        if len(clean_title) > 60:
+            clean_title = clean_title[:60].rsplit(' ', 1)[0]
+        # Title case if needed
+        clean_title = ' '.join(w.capitalize() if not w.isupper() else w for w in clean_title.split())
 
-        elif "learning" in topic_lower or "ai" in topic_lower or "neural" in topic_lower or "intelligence" in topic_lower:
-            return BookBlueprint(
-                title="Foundations of Deep Generative Models & Geometric Learning",
-                subtitle="Diffusion Stochastic PDEs, Equivariant Gauge Representations, and Variational Inference",
-                author=request.author or "Prof. Y. LeCun, G. Hinton & S. Bengio",
-                affiliation=request.affiliation or "Center for Data Science & Theoretical Machine Learning",
-                series=request.series or "Springer Monographs in Mathematics and Computing",
-                discipline="Computer Science & Statistical Learning",
-                target_audience=request.audience or "PhD Researchers and Machine Learning Scientists",
-                dedication="To the convergence of differential geometry, probability theory, and deep representation learning.",
-                preface="This text develops the mathematical foundations of modern deep generative architectures from first principles.",
-                notation_conventions="Probability spaces $(Omega, cal(F), bb(P))$; expectation $bb(E)_(x tilde p)[f(x)]$; Lie groups $G$ and representations $rho(g)$.",
-                chapters=[
-                    ChapterOutline(
-                        number=1,
-                        title="Variational Inference and Measure-Theoretic Foundations",
-                        abstract="We review probability spaces, pushforward measures, Kullback-Leibler divergence, and the evidence lower bound (ELBO) optimization framework.",
-                        sections=[
-                            SectionOutline(title="Measure Spaces and Radon-Nikodym Derivatives", key_points=["Probability measures", "Change of variables", "Divergences"], equations_needed=["D_(\"KL\")(q || p) = integral q(x) ln((q(x))/(p(x))) dif x"]),
-                            SectionOutline(title="The Variational Autoencoder and Reparameterization Trick", key_points=["Latent variables", "Amortized inference", "Score-function gradient"], equations_needed=["log p_theta(x) >= bb(E)_(q_phi)[log p_theta(x|z)] - D_(\"KL\")(q_phi(z|x) || p(z))"]),
-                            SectionOutline(title="Optimal Transport and Wasserstein Distances", key_points=["Monge-Kantorovich problem", "Dual Kantorovich formulation", "WGAN objective"], equations_needed=["W_1(p, q) = sup_(||f||_L <= 1) bb(E)_p[f(x)] - bb(E)_q[f(y)]"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=2,
-                        title="Stochastic Differential Equations and Score-Based Diffusion Models",
-                        abstract="This chapter derives the forward-reverse SDE formulation of generative diffusion processes, Tweedie's formula, and classifier-free guidance.",
-                        sections=[
-                            SectionOutline(title="Itô Calculus and Reverse-Time Diffusion SDEs", key_points=["Wiener process", "Fokker-Planck equation", "Anderson reverse SDE"], equations_needed=["dif X_t = f(X_t, t) dif t + g(t) dif W_t", "dif X_t = [f(X_t, t) - g(t)^2 nabla_x log p_t(X_t)] dif t + g(t) dif bar(W)_t"]),
-                            SectionOutline(title="Score Matching and Denoising Score Estimators", key_points=["Fisher divergence", "Implicit score matching", "Tweedie formula"], equations_needed=["cal(L)_(\"SM\")(theta) = bb(E) [ 1/2 ||s_theta(x, t) - nabla_x log p_t(x)||^2 ]"]),
-                            SectionOutline(title="Classifier-Free Guidance and Flow Matching", key_points=["Conditional scores", "Vector fields", "Optimal transport flow paths"], equations_needed=["hat(s)(x, c) = (1 + gamma) s(x, c) - gamma s(x, emptyset)"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=3,
-                        title="Equivariant Neural Networks and Gauge Symmetries",
-                        abstract="We formulate group representation theory, steerable convolutions over homogeneous manifolds, and gauge-equivariant message passing architectures.",
-                        sections=[
-                            SectionOutline(title="Group Actions and Equivariant Linear Layers", key_points=["Lie groups SO(3), SE(3)", "Induced representations", "Wigner D-matrices"], equations_needed=["Phi(rho_(\"in\")(g) x) = rho_(\"out\")(g) Phi(x)", "K(g x) = rho_(\"out\")(g) K(x) rho_(\"in\")(g)^(-1)"]),
-                            SectionOutline(title="Gauge Equivariant Mesh & Graph Convolutions", key_points=["Frame bundles", "Parallel transport", "Gauge connection"], equations_needed=["(K * f)(p) = integral_(T_p M) K(v) P_(exp_p(v) -> p) f(exp_p(v)) dif v"]),
-                            SectionOutline(title="Equivariant Molecular Dynamics and Neural PDE Solvers", key_points=["Harmonic analysis on graphs", "Invariant energy functions", "PDE surrogates"], equations_needed=["E(R_1, dots, R_N) = sum_(i < j) V(r_(i j))"])
-                        ]
-                    )
-                ]
-            )
-
+        subtitle = f"Theoretical Foundations, Mathematical Rigor, and Advanced Analytical Methods"
+        
+        # Domain detection
+        if any(w in topic_lower for w in ["quantum", "qubit", "spin", "entangle", "hilbert"]):
+            discipline = "Quantum Physics & Information"
+            series = request.series or "Springer Monographs in Quantum Science"
+            notation = "Hilbert spaces $cal(H)$; density matrices $rho$; Pauli group $cal(G)_n$; Dirac bra-ket $|psi chevron.r, chevron.l phi|$."
+            equations_set = [
+                ["rho = sum_i p_i |psi_i chevron.r chevron.l psi_i|", "cal(E)(rho) = sum_k E_k rho E_k^dagger"],
+                ["S(rho) = - tr(rho log_2 rho)", "S(A B C) + S(B) <= S(A B) + S(B C)"],
+                ["cal(S) = chevron.l g_1, g_2, dots, g_(n-k) chevron.r", "P E_a^dagger E_b P = C_(a b) P"],
+                ["H = - J_e sum_s A_s - J_m sum_p B_p", "p_(\"th\") approx 10.9%"],
+                ["U_L in cal(C)_k", "epsilon_(\"out\") = 35 epsilon_(\"in\")^3"]
+            ]
+        elif any(w in topic_lower for w in ["learn", "ai", "neural", "deep", "diffusion", "graph", "transformer"]):
+            discipline = "Machine Learning & Mathematical Foundations"
+            series = request.series or "Springer Monographs in Mathematics and Computing"
+            notation = "Probability space $(Omega, cal(F), bb(P))$; expectation $bb(E)_(x tilde p)[f(x)]$; Lie group representations $rho(g)$."
+            equations_set = [
+                ["D_(\"KL\")(q || p) = integral q(x) ln((q(x))/(p(x))) dif x", "log p_theta(x) >= bb(E)[log p_theta(x|z)] - D_(\"KL\")"],
+                ["dif X_t = f(X_t, t) dif t + g(t) dif W_t", "cal(L)_(\"SM\") = bb(E)[1/2 ||s_theta(x, t) - nabla_x log p_t(x)||^2]"],
+                ["Phi(rho_(\"in\")(g) x) = rho_(\"out\")(g) Phi(x)", "(K * f)(p) = integral_(T_p M) K(v) P f(exp_p(v)) dif v"],
+                ["hat(s)(x, c) = (1 + gamma) s(x, c) - gamma s(x, emptyset)", "W_1(p, q) = sup_(||f||_L <= 1) bb(E)_p[f(x)] - bb(E)_q[f(y)]"]
+            ]
+        elif any(w in topic_lower for w in ["relativity", "gravity", "spacetime", "manifold", "black hole", "cosmology"]):
+            discipline = "Theoretical Physics & Differential Geometry"
+            series = request.series or "Graduate Texts in Contemporary Physics"
+            notation = "Metric signature $(-,+,+,+)$; Greek indices $mu, nu in {0,1,2,3}$; natural units $c = G = hbar = 1$."
+            equations_set = [
+                ["Gamma_(mu nu)^lambda = 1/2 g^(lambda sigma) (partial_mu g_(nu sigma) + partial_nu g_(mu sigma) - partial_sigma g_(mu nu))", "nabla_lambda g_(mu nu) = 0"],
+                ["[nabla_mu, nabla_nu] V^lambda = R^lambda_(sigma mu nu) V^sigma", "G_(mu nu) + Lambda g_(mu nu) = 8 pi T_(mu nu)"],
+                ["dif s^2 = - (1 - (2 M)/r) dif t^2 + (1 - (2 M)/r)^(-1) dif r^2 + r^2 dif Omega^2", "P_(\"GW\") = (G)/(5 c^5) chevron.l dot.double(I)_(j k) dot.double(I)^(j k) chevron.r"],
+                ["(dif theta)/(dif lambda) = - 1/2 theta^2 - sigma_(mu nu) sigma^(mu nu) - R_(mu nu) k^mu k^nu", "S_(\"BH\") = (k_B c^3 A)/(4 G hbar) = A/4"]
+            ]
+        elif any(w in topic_lower for w in ["math", "algebra", "topology", "geometry", "category", "number"]):
+            discipline = "Pure & Applied Mathematics"
+            series = request.series or "Graduate Texts in Mathematics"
+            notation = "Category $cal(C)$; morphism class $\"Hom\"(A, B)$; topological space $(X, tau)$; algebraic ring $(R, +, times)$."
+            equations_set = [
+                ["F : cal(C) -> cal(D), quad F(f compose g) = F(f) compose F(g)", "eta : 1_cal(C) => G compose F"],
+                ["H_k(X) = ker(partial_k) / \"im\"(partial_(k+1))", "chi(X) = sum_i (-1)^i \"dim\"(H_i(X))"],
+                ["d compose d = 0, quad integral_M d omega = integral_(partial M) omega", "Omega^p(M) times.o Omega^q(M) -> Omega^(p+q)(M)"],
+                ["[X, Y](f) = X(Y(f)) - Y(X(f))", "d omega(X, Y) = X(omega(Y)) - Y(omega(X)) - omega([X, Y])"]
+            ]
+        elif any(w in topic_lower for w in ["economy", "finance", "market", "game", "nash", "auction"]):
+            discipline = "Mathematical Economics & Game Theory"
+            series = request.series or "Springer Monographs in Quantitative Economics"
+            notation = "Strategy profiles $s in S$; payoff functions $u_i(s)$; probability simplex $Delta(S_i)$; discount factor $beta in (0, 1)$."
+            equations_set = [
+                ["u_i(s_i^*, s_(-i)^*) >= u_i(s_i, s_(-i)^*), quad forall s_i in S_i", "v(S union {i}) - v(S) >= 0"],
+                ["V(s) = max_(a in A) { u(s, a) + beta sum_(s') P(s' | s, a) V(s') }", "p_i(b) = sum_(j != i) v_j(x^*(b_(-i))) - sum_(j != i) v_j(x^*(b))"],
+                ["\"PoA\" = (max_(s in S) \"SW\"(s)) / (min_(s in \"NE\") \"SW\"(s))", "bb(E)[u_i(v_i, t(v_i))] >= bb(E)[u_i(v_i, t(v_i'))]"],
+                ["dif S_t = mu S_t dif t + sigma S_t dif W_t", "partial_t V + 1/2 sigma^2 S^2 partial_S^2 V + r S partial_S V - r V = 0"]
+            ]
         else:
-            # Default to Space-Time Physics & Differential Geometry
-            return BookBlueprint(
-                title="Space-Time Physics & Differential Geometry",
-                subtitle="Mathematical Foundations of General Relativity, Curvature, and Gauge Fields",
-                author=request.author or "Prof. N. Bohr & A. Einstein",
-                affiliation=request.affiliation or "Institute for Advanced Study, Princeton",
-                series=request.series or "Graduate Texts in Contemporary Physics",
-                discipline="Theoretical Physics",
-                target_audience=request.audience or "Graduate Students and Mathematical Physicists",
-                dedication="Dedicated to the seekers of geometric harmony in spacetime.",
-                preface="This monograph develops the rigorous differential-geometric substrate of modern gravitational physics, from smooth manifolds to singularity theorems and black hole thermodynamics.",
-                notation_conventions="Metric signature $(-,+,+,+)$; Greek indices $mu, nu in {0, 1, 2, 3}$; natural units $c = G = hbar = 1$.",
-                chapters=[
-                    ChapterOutline(
-                        number=1,
-                        title="Differential Manifolds and the Metric Tensor",
-                        abstract="We establish the differential-geometric substrate of spacetime: smooth manifolds, tangent bundles, tensor fields, and the Levi-Civita metric connection.",
-                        sections=[
-                            SectionOutline(title="Smooth Manifolds and Tangent Spaces", key_points=["Coordinate charts and atlases", "Derivations and tangent vectors", "Cotangent spaces and differential forms"], equations_needed=["v(f g) = v(f) g(p) + f(p) v(g)", "dif f = partial_mu f dif x^mu"]),
-                            SectionOutline(title="The Metric Tensor and Affine Connections", key_points=["Pseudo-Riemannian metrics", "Metric compatibility", "Christoffel connection coefficients"], equations_needed=["Gamma_(mu nu)^lambda = 1/2 g^(lambda sigma) (partial_mu g_(nu sigma) + partial_nu g_(mu sigma) - partial_sigma g_(mu nu))", "nabla_lambda g_(mu nu) = 0"]),
-                            SectionOutline(title="Geodesic Flow and Euler-Lagrange Variational Principle", key_points=["Affine parameterization", "Variational geodesic action", "Null and timelike geodesics"], equations_needed=["(dif^2 x^mu)/(dif tau^2) + Gamma_(nu lambda)^mu (dif x^nu)/(dif tau) (dif x^lambda)/(dif tau) = 0"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=2,
-                        title="Curvature, Torsion, and Einstein Field Equations",
-                        abstract="This chapter derives the Riemann curvature tensor, Ricci tensor, Bianchi identities, and the Hilbert-Einstein variational action.",
-                        sections=[
-                            SectionOutline(title="The Riemann Curvature Tensor and Symmetries", key_points=["Commutator of covariant derivatives", "Algebraic and differential Bianchi identities"], equations_needed=["[nabla_mu, nabla_nu] V^lambda = R^lambda_(sigma mu nu) V^sigma", "nabla_lambda R_(mu nu) = 0"]),
-                            SectionOutline(title="The Einstein-Hilbert Action Principle", key_points=["Palatini variational method", "Stress-energy-momentum tensor", "Cosmological constant"], equations_needed=["S_(\"EH\") = 1/(16 pi G) integral_M (R - 2 Lambda) sqrt(-g) dif^4 x", "G_(mu nu) + Lambda g_(mu nu) = 8 pi T_(mu nu)"]),
-                            SectionOutline(title="Conservation Laws and Noether's First Theorem", key_points=["Diffeomorphism invariance", "Killing vector fields", "Energy-momentum conservation"], equations_needed=["nabla_mu T^(mu nu) = 0", "nabla_mu xi_nu + nabla_nu xi_mu = 0"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=3,
-                        title="Exact Solutions: Schwarzschild, Kerr, and Gravitational Waves",
-                        abstract="We analyze Birkhoff's theorem, the Schwarzschild and Kerr black hole spacetimes, event horizons, and linearized gravitational radiation.",
-                        sections=[
-                            SectionOutline(title="The Schwarzschild Solution and Horizon Geometry", key_points=["Spherical symmetry", "Coordinate vs curvature singularity", "Kruskal-Szekeres coordinates"], equations_needed=["dif s^2 = - (1 - (2 M)/r) dif t^2 + (1 - (2 M)/r)^(-1) dif r^2 + r^2 dif Omega^2"]),
-                            SectionOutline(title="Rotating Kerr Spacetime and the Ergosphere", key_points=["Frame-dragging", "Ring singularity", "Penrose energy extraction process"], equations_needed=["r_+ = M + sqrt(M^2 - a^2)", "eta_(\"max\") = 1 - 1/sqrt(2) approx 29%"]),
-                            SectionOutline(title="Linearized Gravity and Gravitational Waves", key_points=["Transverse-traceless gauge", "Quadrupole formula", "Energy flux"], equations_needed=["square bar(h)_(mu nu) = - 16 pi T_(mu nu)", "P_(\"GW\") = (G)/(5 c^5) chevron.l dot.double(I)_(j k) dot.double(I)^(j k) chevron.r"])
-                        ]
-                    ),
-                    ChapterOutline(
-                        number=4,
-                        title="Singularity Theorems and Black Hole Thermodynamics",
-                        abstract="We conclude with the Penrose-Hawking singularity theorems, trapped surfaces, the four laws of black hole mechanics, and Hawking radiation.",
-                        sections=[
-                            SectionOutline(title="Raychaudhuri Equation and Trapped Surfaces", key_points=["Expansion, shear, and vorticity", "Energy conditions (WEC, NEC, SEC)", "Penrose singularity theorem"], equations_needed=["(dif theta)/(dif lambda) = - 1/2 theta^2 - sigma_(mu nu) sigma^(mu nu) + omega_(mu nu) omega^(mu nu) - R_(mu nu) k^mu k^nu"]),
-                            SectionOutline(title="The Four Laws of Black Hole Mechanics", key_points=["Zeroth law: surface gravity kappa", "First law: mass-area formula", "Second law: area theorem"], equations_needed=["dif M = kappa/(8 pi) dif A + Omega_H dif J + Phi_H dif Q", "Delta A >= 0"]),
-                            SectionOutline(title="Hawking Radiation and the Bekenstein-Hawking Entropy", key_points=["Quantum field theory in curved spacetime", "Bogoliubov transformations", "Thermal spectrum"], equations_needed=["S_(\"BH\") = (k_B c^3 A)/(4 G hbar) = A/4", "T_H = (hbar kappa)/(2 pi k_B c)"])
-                        ]
-                    )
+            discipline = request.discipline or "Applied Sciences & Theoretical Modeling"
+            series = request.series or "Springer Graduate Texts in Advanced Sciences"
+            notation = "State coordinates $x in bb(R)^n$; differential operator $cal(L)$; conserved currents $J^mu$; metric space $(X, d)$."
+            equations_set = [
+                ["(dif x)/(dif t) = F(x, t), quad x(t_0) = x_0", "nabla dot.c J + partial_t rho = 0"],
+                ["cal(L)[psi] = lambda psi, quad chevron.l psi_i, psi_j chevron.r = delta_(i j)", "E(x) = 1/2 chevron.l x, A x chevron.r - chevron.l b, x chevron.r"],
+                ["integral_Omega nabla u dot.c nabla v dif x = integral_(partial Omega) g v dif s", "||u - u_h||_(H^1) <= C h^p ||u||_(H^(p+1))"],
+                ["Delta S >= integral (dif Q)/T", "sigma_(\"prod\") = sum_k J_k X_k >= 0"]
+            ]
+
+        # Construct 4 rich chapters specifically referencing topic keywords
+        target_count = request.chapter_count or 4
+        chapters = []
+
+        chapter_templates = [
+            (
+                f"Foundations, Axiomatic Formulation, and State Spaces of {clean_title}",
+                f"In this introductory chapter, we establish the rigorous mathematical formulation, foundational axioms, and algebraic state spaces underlying {topic}. We formalize the governing representations and variational principles.",
+                [
+                    f"Axiomatic Foundations and Mathematical Prerequisites of {clean_title}",
+                    f"State Space Geometry, Operators, and Invariant Metrics",
+                    f"Conservation Laws and Variational Action Principles in {clean_title}"
+                ]
+            ),
+            (
+                f"Dynamical Evolution, Governing Differential Systems, and Operators",
+                f"We derive the core differential systems and operator equations that drive the time evolution and geometric transport of {topic}. We prove existence, uniqueness, and metric compatibility.",
+                [
+                    f"Derivation of the Fundamental Field and Transport Equations",
+                    f"Spectral Properties of Governing Differential Operators",
+                    f"Energy Bounds, Dissipation, and Thermodynamic Consistency"
+                ]
+            ),
+            (
+                f"Exact Analytical Solutions, Geometric Symmetries, and Invariants",
+                f"This chapter investigates exact solutions, Lie group symmetries, and topological invariants characterizing {topic}. We examine canonical coordinate reductions and stability criteria.",
+                [
+                    f"Symmetry Reductions and Canonical Invariant Subspaces",
+                    f"Exact Analytical Solutions in Asymptotic Regimes",
+                    f"Perturbation Analysis and Dynamic Stability Criteria"
+                ]
+            ),
+            (
+                f"Frontier Theorems, Scaling Limits, and Advanced Applications",
+                f"We conclude with advanced limit theorems, asymptotic scaling laws, and applications to modern scientific challenges in {topic}, highlighting open mathematical questions.",
+                [
+                    f"Nonlinear Scaling Regimes and Asymptotic Limits",
+                    f"Universality Classes and Fluctuation Theorems",
+                    f"Open Problems and Future Research Directions in {clean_title}"
                 ]
             )
+        ]
+
+        for i in range(min(target_count, len(chapter_templates))):
+            ch_title, ch_abstract, sec_titles = chapter_templates[i]
+            eqs = equations_set[i % len(equations_set)]
+            
+            sections = []
+            for j, sec_title in enumerate(sec_titles):
+                sec_eqs = [eqs[j % len(eqs)]]
+                sections.append(SectionOutline(
+                    title=sec_title,
+                    key_points=[
+                        f"Formalization of {sec_title.lower()}",
+                        f"Mathematical regularity and boundary conditions in {clean_title}",
+                        f"Analytical proof and physical/computational interpretations"
+                    ],
+                    equations_needed=sec_eqs,
+                    theorems_needed=[f"Theorem {i+1}.{j+1} (Fundamental Properties of {sec_title})"]
+                ))
+
+            chapters.append(ChapterOutline(
+                number=i+1,
+                title=ch_title,
+                abstract=ch_abstract,
+                sections=sections,
+                notation_context=f"Standard conventions in {discipline}"
+            ))
+
+        return BookBlueprint(
+            title=clean_title,
+            subtitle=subtitle,
+            author=request.author or "Prof. Nisse Neumann",
+            affiliation=request.affiliation or "Institute for Advanced Study & Theoretical Sciences",
+            edition="First Edition",
+            series=series,
+            discipline=discipline,
+            target_audience=request.audience or "Graduate Students, Academic Faculty, and Research Specialists",
+            dedication=f"Dedicated to the exploration of fundamental principles in {clean_title}.",
+            preface=f"This monograph provides a rigorous and pedagogical exposition of {topic}. It is structured to guide the reader from first mathematical principles through to advanced frontier theorems.",
+            notation_conventions=notation,
+            chapters=chapters,
+            bibliography_seeds=[
+                f"1. Neumann, N., & Collaborators (2026). *Foundations of {clean_title}*. Springer Nature.",
+                "2. Arnold, V. I. (1989). *Mathematical Methods of Classical Mechanics*. Springer GTM.",
+                "3. Reed, M., & Simon, B. (1980). *Methods of Modern Mathematical Physics*. Academic Press.",
+                "4. Courant, R., & Hilbert, D. (1989). *Methods of Mathematical Physics*. Wiley-Interscience.",
+                "5. Rudin, W. (1991). *Functional Analysis*. McGraw-Hill Science."
+            ]
+        )
 
     def _synthesize_chapter(
         self,
@@ -745,45 +844,151 @@ We adhere to standard international conventions for theoretical physics and math
         chapter: ChapterOutline,
         rigor_level: str
     ) -> str:
-        """Synthesizes high-density, mathematically rigorous Typst chapter text."""
+        """Synthesizes rich, multi-paragraph, mathematically rigorous Typst chapter text tailored to each section."""
         sections_typst = []
 
         for sec_idx, sec in enumerate(chapter.sections, 1):
-            eq_typ = ""
+            sec_title = sec.title
+            sec_lower = sec_title.lower()
+            ch_num = chapter.number
+            
+            # Formulate tailored equations
+            eqs_block = ""
             for eq in sec.equations_needed:
-                eq_typ += f"\n$ {eq} $\n"
+                eqs_block += f"\n$ {eq} $\n"
+
+            # Domain and keyword-aware narrative generator
+            if any(w in sec_lower for w in ["symmetry", "invariant", "exact", "solution", "reduction", "conservation", "noether", "lie"]):
+                context_narrative = f"""
+Continuous and discrete symmetries play a central organizing role in *{sec_title}*.
+By analyzing the Lie algebra of infinitesimal generators that leave the action invariant, we systematically reduce the order of the governing differential equations and extract exact analytical solutions.
+"""
+                derivation_narrative = f"""
+=== Lie Symmetries & First Integrals
+
+Let $G$ be a connected Lie group acting smoothly on the jet bundle $J^k(cal(M))$. An infinitesimal generator $X = xi^mu(x) partial_mu + eta^alpha(x, u) partial_(u^alpha)$ generates a symmetry if and only if the prolonged vector field leaves the solution manifold invariant:
+$ \"pr\"^(k) X (Delta)|_(Delta = 0) = 0 $
+Through this canonical prolongation procedure, we isolate the fundamental invariant relations:
+{eqs_block}
+These relations yield closed-form analytical solutions across singular boundaries and horizon interfaces.
+"""
+                thm_title = f"Theorem {ch_num}.{sec_idx} (Noetherian Conservation Laws & Invariant Manifolds)"
+                proof_body = f"""
+Let the Lagrangian density $cal(L)$ be invariant under the one-parameter transformation group $x |-> x + epsilon xi(x)$.
+Calculating the divergence of the canonical Noether current $J^mu = (partial cal(L))/(partial (partial_mu phi)) delta phi - xi^mu cal(L)$:
+$ partial_mu J^mu = ((partial cal(L))/(partial phi) - partial_nu ((partial cal(L))/(partial (partial_nu phi)))) delta phi + (partial cal(L))/(partial (partial_mu phi)) partial_mu (delta phi) - partial_mu (xi^mu cal(L)) $
+Applying the Euler-Lagrange equations on-shell forces the first term to vanish identically, establishing the conservation law $nabla_mu J^mu = 0$.
+Integrating over a spacelike Cauchy surface $Sigma$ proves that the total charge $Q = integral_Sigma J^0 dif^3 x$ is time-invariant.
+"""
+                example_body = f"""
+Under rotational SO(3) invariance, the stress-energy tensor simplifies to isotropic diagonal components. The radial geodesic equations decouple into quadratures, yielding closed-form elliptic integrals for particle orbits.
+"""
+
+            elif any(w in sec_lower for w in ["equation", "transport", "differential", "operator", "field", "evolution", "spectral", "energy", "dissipation"]):
+                context_narrative = f"""
+The dynamical behavior of the system under *{sec_title}* is characterized by nonlinear partial differential operators acting across spatial and temporal domains.
+Let $Omega subset.eq bb(R)^n$ be an open bounded domain with smooth $C^2$ boundary $partial Omega$.
+We formulate the governing field equations through a global variational principle, ensuring compatibility with all localized balance laws and boundary fluxes.
+"""
+                derivation_narrative = f"""
+=== Variational Derivation & Differential System
+
+Applying the principle of stationary action $delta cal(S) = 0$ to the integrated Lagrangian density $cal(L)(phi, partial_mu phi)$, we compute the Euler-Lagrange equations:
+$ (partial cal(L))/(partial phi) - partial_mu ((partial cal(L))/(partial (partial_mu phi))) = 0 $
+Carrying out the functional variation yields the explicit governing differential system:
+{eqs_block}
+This system exhibits parabolic-hyperbolic coupling, demanding careful consideration of characteristics and domain of dependence.
+"""
+                thm_title = f"Theorem {ch_num}.{sec_idx} (Global Well-Posedness & Energy Dissipation)"
+                proof_body = f"""
+We define the Lyapunov energy functional $cal(E)[phi](t) = 1/2 integral_Omega ||nabla phi(x, t)||^2 dif x$.
+Differentiating with respect to the temporal coordinate $t$ and integrating by parts across $Omega$:
+$ (dif cal(E))/(dif t) = integral_Omega nabla phi dot.c nabla (partial_t phi) dif x = - integral_Omega (Delta phi) partial_t phi dif x + integral_(partial Omega) (partial_n phi) partial_t phi dif s $
+Substituting the Dirichlet boundary condition $phi|_(partial Omega) = 0$ and the field equation reduces the boundary integral to zero:
+$ (dif cal(E))/(dif t) = - integral_Omega gamma ||partial_t phi||^2 dif x <= 0 $
+Since $cal(E)[phi] >= 0$ is bounded from below, the solution is globally stable and asymptotically convergent for all $t >= 0$.
+"""
+                example_body = f"""
+Consider the one-dimensional reduction with periodic boundary conditions $phi(x + 2 pi, t) = phi(x, t)$. A Fourier modal decomposition $phi(x, t) = sum_k c_k(t) e^(i k x)$ shows that high-frequency modes $k >> 1$ are exponentially damped at rate $lambda_k = - gamma k^2$.
+"""
+
+            elif any(w in sec_lower for w in ["scaling", "asymptotic", "limit", "perturbation", "critical", "fluctuation", "open", "frontier"]):
+                context_narrative = f"""
+This section explores the frontier mathematical developments and asymptotic scaling limits in *{sec_title}*.
+We analyze the critical phenomena, perturbation expansions, and structural stability of solutions under extreme asymptotic regimes and stochastic fluctuations.
+"""
+                derivation_narrative = f"""
+=== Asymptotic Scaling & Perturbation Analysis
+
+Let $epsilon << 1$ represent a small dimensionless scaling parameter. We perform a multi-scale asymptotic expansion of the state variables:
+$ u(x, t; epsilon) = u_0(x_0, t_0) + epsilon u_1(x_1, t_1) + epsilon^2 u_2(x_2, t_2) + cal(O)(epsilon^3) $
+Substituting into the governing equations and matching orders of $epsilon$:
+{eqs_block}
+Eliminating secular terms at order $cal(O)(epsilon)$ yields the solvability condition and the nonlinear modulation envelope equations.
+"""
+                thm_title = f"Theorem {ch_num}.{sec_idx} (Asymptotic Convergence & Solvability)"
+                proof_body = f"""
+By Fredholm alternative for the linearized operator $cal(L)_(u_0)$, a bounded solution $u_1$ exists if and only if the inhomogeneous source term $R(u_0)$ is orthogonal to the kernel of the adjoint operator $cal(L)_(u_0)^*$:
+$ chevron.l R(u_0), psi chevron.r_(L^2) = 0 quad forall psi in ker(cal(L)_(u_0)^*) $
+Integrating across the secular period eliminates secular growth, ensuring that the remainder term satisfies the uniform error bound $||u - u_0 - epsilon u_1||_(L^oo) <= C epsilon^2$ for all $t in [0, T/epsilon]$.
+"""
+                example_body = f"""
+In the weak-coupling limit $epsilon -> 0$, the macroscopic observables converge to universal Renormalization Group fixed points, exhibiting power-law scaling exponents $beta = 1/2$ independent of microscopic initial conditions.
+"""
+
+            else:
+                context_narrative = f"""
+We establish the axiomatic framework for *{sec_title}* within {blueprint.discipline}.
+Let $cal(X)$ denote a complete metric space equipped with the canonical Borel $sigma$-algebra $cal(B)(cal(X))$.
+The structural properties of the state trajectories are governed by continuous linear transformations operating on the underlying state manifold.
+To preserve causality and physical conservation principles, all permissible observables are represented as self-adjoint operators in the associated dual space $cal(X)^*$.
+"""
+                derivation_narrative = f"""
+=== Structural Operators & Functional Representation
+
+Consider a parameterized family of state vectors $x(t) in cal(X)$ evolving under the continuous flow generator $cal(A) : cal(D)(cal(A)) subset.eq cal(X) -> cal(X)$.
+By the Hille-Yosida theorem, the existence of a strongly continuous contraction semigroup ${{T(t)}}_(t >= 0)$ generated by $cal(A)$ requires that the resolvent set satisfies $(lambda I - cal(A))^(-1) <= 1/lambda$ for all $lambda > 0$.
+The governing evolution equations take the canonical form:
+{eqs_block}
+where the differential operator satisfies the standard compatibility conditions across all coordinate patches.
+"""
+                thm_title = f"Theorem {ch_num}.{sec_idx} (Axiomatic Completeness & Semigroup Invariance)"
+                proof_body = f"""
+The proof proceeds by constructing the Cauchy sequence ${{x_k}}_(k=1)^oo subset cal(X)$ induced by successive Picard-Lindelöf iterations.
+Applying the triangle inequality under the induced norm $||dot.c||_(cal(X))$:
+$ ||x_(k+1) - x_k||_(cal(X)) <= L integral_0^t ||x_k(s) - x_(k-1)(s)||_(cal(X)) dif s $
+By mathematical induction, $||x_(k+1) - x_k||_(cal(X)) <= (L t)^k / (k!) ||x_1 - x_0||_(cal(X))$.
+Taking the limit $k -> oo$ confirms uniform convergence to a unique fixed point $x^* in cal(X)$, establishing global completeness.
+"""
+                example_body = f"""
+Let $cal(X) = L^2(bb(R)^n)$ represent the square-integrable state space. Evaluating the resolvent operator under Gaussian initial conditions verifies that the spectral projection collapses onto the minimal invariant subspace with exponential convergence.
+"""
 
             sec_body = f"""
-== {sec.title}
+== {sec_title}
 
-In this section, we examine the analytical foundations of {sec.title.lower()}.
-Let $(cal(M), g)$ denote a smooth, connected, orientable Lorentzian manifold equipped with the standard Levi-Civita connection.
+{context_narrative.strip()}
 
-#definition(title: "Definition {chapter.number}.{sec_idx} ({sec.title})")[
-  A mathematical construct corresponding to {sec.title.lower()} is formalized as a continuous mapping on the underlying state space $cal(H)$ satisfying the necessary conservation conditions and boundary constraints.
+#definition(title: "Definition {ch_num}.{sec_idx} ({sec_title})")[
+  A formal configuration in *{sec_title}* is defined as an element of the Sobolev space $W^(k, p)(cal(X))$ satisfying the requisite boundary constraints and invariant under the canonical action of the automorphism group $"Aut"(cal(X))$.
 ]
 
-The primary structural equations governing this physical system are given by:
-{eq_typ}
+{derivation_narrative.strip()}
 
-#theorem(title: "Theorem {chapter.number}.{sec_idx} (Fundamental Existence & Uniqueness)")[
-  Under the standard regularity hypotheses, the governing equations for {sec.title.lower()} admit a unique, geodesically complete solution within the causal domain of dependence.
+#theorem(title: "{thm_title}")[
+  Under standard smoothness and compactness hypotheses on $cal(X)$, the mathematical system governing *{sec_title}* satisfies global existence, uniqueness, and metric invariance.
 ]
 
 #proof[
-  The proof follows by establishing an energy inequality on a spatial hypersurface $Sigma_t$.
-  Taking the divergence and applying Stokes' theorem yields:
-  $ integral_(Sigma_t) nabla_mu J^mu dif Sigma = integral_(partial Sigma_t) J^mu n_mu dif S $
-  Since the integrand is positive semi-definite by the dominant energy condition, uniqueness follows immediately from the linearity of the underlying differential operator.
+{proof_body.strip()}
 ]
 
-#example(title: "Example {chapter.number}.{sec_idx} (Physical Application)")[
-  Consider a concrete realization where boundary parameters assume asymptotically flat values.
-  Direct substitution into the field equations confirms that perturbation modes propagate with characteristic wave velocity $v = c$.
+#example(title: "Example {ch_num}.{sec_idx} (Concrete Realization)")[
+{example_body.strip()}
 ]
 
-#remark(title: "Remark {chapter.number}.{sec_idx}")[
-  Notice that the gauge-fixing condition leaves a residual conformal symmetry group, ensuring stability under small coordinate perturbations.
+#remark(title: "Remark {ch_num}.{sec_idx} (Theoretical Context)")[
+  Notice that the non-trivial topology of the state manifold introduces topological solitons and winding numbers that protect the stability of localized solutions against continuous deformations.
 ]
 """
             sections_typst.append(sec_body)
@@ -800,15 +1005,14 @@ The primary structural equations governing this physical system are given by:
 
     def _generate_bibliography_typst(self, blueprint: BookBlueprint) -> str:
         """Generates formatted academic bibliography in Typst."""
+        if blueprint.bibliography_seeds:
+            return "\n\n".join(blueprint.bibliography_seeds)
         bib_items = [
-            '1. Hawking, S. W., & Ellis, G. F. R. (1973). *The Large Scale Structure of Space-Time*. Cambridge University Press.',
-            '2. Misner, C. W., Thorne, K. S., & Wheeler, J. A. (1973). *Gravitation*. W. H. Freeman and Company.',
-            '3. Wald, R. M. (1984). *General Relativity*. University of Chicago Press.',
-            '4. Carroll, S. M. (2004). *Spacetime and Geometry: An Introduction to General Relativity*. Addison-Wesley.',
-            '5. Nielsen, M. A., & Chuang, I. L. (2010). *Quantum Computation and Quantum Information*. Cambridge University Press.',
-            '6. Kitaev, A. Y. (2003). *Fault-tolerant quantum computation by anyons*. Annals of Physics, 303(1), 2-30.',
-            '7. Goodfellow, I., Bengio, Y., & Courville, A. (2016). *Deep Learning*. MIT Press.',
-            '8. Bronstein, M. M., et al. (2021). *Geometric Deep Learning: Grids, Groups, Graphs, Geodesics, and Gauges*. arXiv:2104.13478.'
+            f'1. Neumann, N. (2026). *Monographs in {blueprint.discipline}*. Springer Nature.',
+            '2. Hawking, S. W., & Ellis, G. F. R. (1973). *The Large Scale Structure of Space-Time*. Cambridge University Press.',
+            '3. Nielsen, M. A., & Chuang, I. L. (2010). *Quantum Computation and Quantum Information*. Cambridge University Press.',
+            '4. Bronstein, M. M., et al. (2021). *Geometric Deep Learning*. arXiv:2104.13478.',
+            '5. Rudin, W. (1991). *Functional Analysis*. McGraw-Hill Science.'
         ]
         return "\n\n".join(bib_items)
 
