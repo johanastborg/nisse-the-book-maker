@@ -51,7 +51,8 @@ class GenerateBookRequest(BaseModel):
 
 
 class RecompileRequest(BaseModel):
-    typst_source: str = Field(..., description="Modified Typst source code to recompile")
+    typst_source: Optional[str] = Field(default="", description="Typst source code (deprecated)")
+    latex_source: Optional[str] = Field(default="", description="Modified LaTeX source code to recompile")
 
 
 class BookSummary(BaseModel):
@@ -71,7 +72,8 @@ class BookSummary(BaseModel):
 class BookDetail(BaseModel):
     id: str
     blueprint: BookBlueprint
-    master_typst: str
+    master_typst: Optional[str] = Field(default="", description="Legacy Typst source")
+    master_latex: Optional[str] = Field(default="", description="Master LaTeX source")
     chapter_drafts: List[str]
     created_at: str
     status: str

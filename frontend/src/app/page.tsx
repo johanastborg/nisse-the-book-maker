@@ -163,7 +163,7 @@ export default function HomePage() {
         onBookCompleted: async (data) => {
           setCurrentStage(4);
           setCompileMs(data.compile_duration_ms);
-          addLog('Typst Engine', data.log, 'success');
+          addLog('LaTeX Engine', data.log, 'success');
           
           // Trigger celebration confetti
           try {
@@ -312,7 +312,7 @@ export default function HomePage() {
                   }`}
                 >
                   <FileCode2 className="h-3.5 w-3.5" />
-                  Typst Source Editor
+                  LaTeX Source Editor
                 </button>
 
                 <button

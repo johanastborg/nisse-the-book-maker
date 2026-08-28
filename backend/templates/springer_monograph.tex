@@ -1,0 +1,107 @@
+\documentclass[11pt,a4paper,openany]{book}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools}
+\usepackage{geometry}
+\geometry{top=2.5cm, bottom=2.5cm, left=2.8cm, right=2.8cm, headheight=14pt}
+
+\usepackage{xcolor}
+\definecolor{springerblue}{RGB}{15, 23, 42}
+\definecolor{springeraccent}{RGB}{37, 99, 235}
+\definecolor{boxbg}{RGB}{248, 250, 252}
+\definecolor{boxborder}{RGB}{203, 213, 225}
+\definecolor{theoremborder}{RGB}{59, 130, 246}
+\definecolor{defborder}{RGB}{16, 185, 129}
+\definecolor{remarkborder}{RGB}{245, 158, 11}
+
+\usepackage[most]{tcolorbox}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{hyperref}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=springeraccent,
+    citecolor=springeraccent,
+    urlcolor=springeraccent
+}
+
+% Dirac Bra-Ket and Quantum Macros
+\providecommand{\ket}[1]{\left|#1\right\rangle}
+\providecommand{\bra}[1]{\left\langle#1\right|}
+\providecommand{\braket}[2]{\left\langle#1\middle|#2\right\rangle}
+\providecommand{\ketbra}[2]{\left|#1\middle\rangle\middle\langle#2\right|}
+\providecommand{\Tr}{\operatorname{Tr}}
+\providecommand{\tr}{\operatorname{Tr}}
+\providecommand{\diag}{\operatorname{diag}}
+\providecommand{\rank}{\operatorname{rank}}
+\providecommand{\dim}{\operatorname{dim}}
+\providecommand{\ker}{\operatorname{ker}}
+\providecommand{\supp}{\operatorname{supp}}
+\providecommand{\End}{\operatorname{End}}
+\providecommand{\Hom}{\operatorname{Hom}}
+\providecommand{\Aut}{\operatorname{Aut}}
+\providecommand{\Spec}{\operatorname{Spec}}
+\providecommand{\CNOT}{\operatorname{CNOT}}
+\providecommand{\SWAP}{\operatorname{SWAP}}
+\providecommand{\GHZ}{\operatorname{GHZ}}
+\providecommand{\EPR}{\operatorname{EPR}}
+\providecommand{\QFT}{\operatorname{QFT}}
+\providecommand{\QPE}{\operatorname{QPE}}
+\providecommand{\QEC}{\operatorname{QEC}}
+\providecommand{\NISQ}{\operatorname{NISQ}}
+\providecommand{\FTQC}{\operatorname{FTQC}}
+\providecommand{\VQE}{\operatorname{VQE}}
+\providecommand{\QAOA}{\operatorname{QAOA}}
+
+% Callout Boxes
+\newtcbtheorem[number within=chapter]{SpringerTheorem}{Theorem}{
+    enhanced,
+    colback=boxbg,
+    colframe=theoremborder,
+    coltitle=white,
+    fonttitle=\bfseries,
+    attach boxed title to top left={yshift=-2mm, xshift=4mm},
+    boxed title style={colback=theoremborder, sharp corners},
+    sharp corners,
+    boxrule=1pt,
+    top=4mm, bottom=3mm, left=3mm, right=3mm
+}{thm}
+
+\newtcbtheorem[number within=chapter]{SpringerDefinition}{Definition}{
+    enhanced,
+    colback=boxbg,
+    colframe=defborder,
+    coltitle=white,
+    fonttitle=\bfseries,
+    attach boxed title to top left={yshift=-2mm, xshift=4mm},
+    boxed title style={colback=defborder, sharp corners},
+    sharp corners,
+    boxrule=1pt,
+    top=4mm, bottom=3mm, left=3mm, right=3mm
+}{def}
+
+\newtcbtheorem[number within=chapter]{SpringerRemark}{Remark}{
+    enhanced,
+    colback=boxbg,
+    colframe=remarkborder,
+    coltitle=white,
+    fonttitle=\bfseries,
+    attach boxed title to top left={yshift=-2mm, xshift=4mm},
+    boxed title style={colback=remarkborder, sharp corners},
+    sharp corners,
+    boxrule=1pt,
+    top=4mm, bottom=3mm, left=3mm, right=3mm
+}{rem}
+
+% Header & Footer
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE,RO]{\thepage}
+\fancyhead[LO]{\nouppercase{\rightmark}}
+\fancyhead[RE]{\nouppercase{\leftmark}}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% Chapter Header Formatting
+\titleformat{\chapter}[display]
+{\normalfont\huge\bfseries\color{springerblue}}{\color{springeraccent}\chaptertitlename\ \thechapter}{15pt}{\Huge\color{springerblue}}[\vspace{1ex}\titlerule]

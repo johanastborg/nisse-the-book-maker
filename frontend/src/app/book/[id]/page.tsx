@@ -151,7 +151,7 @@ export default function BookDetailPage() {
               }`}
             >
               <FileCode2 className="h-3.5 w-3.5" />
-              Typst Source Editor
+              LaTeX Source Editor
             </button>
 
             <button

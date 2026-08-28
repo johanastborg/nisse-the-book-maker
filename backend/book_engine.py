@@ -4,8 +4,10 @@ import asyncio
 import uuid
 import re
 import time
+import subprocess
+import tempfile
+import shutil
 from typing import AsyncGenerator, Dict, Any, List, Optional
-import typst
 
 from models import (
     BookBlueprint,
@@ -18,114 +20,105 @@ from models import (
 
 WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STORAGE_DIR = os.path.join(os.path.dirname(__file__), "storage", "books")
+TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 os.makedirs(STORAGE_DIR, exist_ok=True)
 
 
-def sanitize_typst(text: str) -> str:
-    """Sanitize LLM output to valid Typst syntax."""
-    # Strip markdown code blocks if the model wrapped it in ```typst ... ```
-    text = re.sub(r"^```(?:typst|typ)?\n", "", text, flags=re.MULTILINE)
+def find_latex_compiler() -> str:
+    """Finds the best available LaTeX engine on the system."""
+    candidates = [
+        "lualatex",
+        "xelatex",
+        "pdflatex",
+        "/opt/homebrew/bin/tectonic",
+        "tectonic",
+        "/Library/TeX/texbin/lualatex",
+        "/Library/TeX/texbin/pdflatex",
+        "/usr/local/bin/tectonic"
+    ]
+    for c in candidates:
+        if os.path.isabs(c) and os.path.exists(c) and os.access(c, os.X_OK):
+            return c
+        if shutil.which(c):
+            return c
+    # Fallback to tectonic in PATH or default
+    return "/opt/homebrew/bin/tectonic"
+
+
+def sanitize_latex(text: str) -> str:
+    """Sanitize LLM output into robust, publication-grade LaTeX markup."""
+    # Strip markdown code fences
+    text = re.sub(r"^```(?:latex|tex)?\n", "", text, flags=re.MULTILINE)
     text = re.sub(r"\n```$", "", text, flags=re.MULTILINE)
-    
-    # Common math translations
-    text = text.replace(r"\nabla", "nabla")
-    text = text.replace(r"\partial", "partial")
-    text = text.replace(r"\mu", "mu")
-    text = text.replace(r"\nu", "nu")
-    text = text.replace(r"\alpha", "alpha")
-    text = text.replace(r"\beta", "beta")
-    text = text.replace(r"\gamma", "gamma")
-    text = text.replace(r"\lambda", "lambda")
-    text = text.replace(r"\sigma", "sigma")
-    text = text.replace(r"\omega", "omega")
-    text = text.replace(r"\theta", "theta")
-    text = text.replace(r"\phi", "phi")
-    text = text.replace(r"\psi", "psi")
-    text = text.replace(r"\infty", "oo")
-    text = text.replace(r"\in", "in")
-    text = text.replace(r"\forall", "forall")
-    text = text.replace(r"\int", "integral")
-    text = text.replace(r"\sum", "sum")
-    text = text.replace(r"\sqrt", "sqrt")
-    text = text.replace(r"\hbar", "hbar")
-    text = text.replace("ddot(", "dot.double(")
-    text = text.replace(r"\langle", "chevron.l")
-    text = text.replace(r"\rangle", "chevron.r")
-    text = text.replace("langle", "chevron.l")
-    text = text.replace("rangle", "chevron.r")
-    text = text.replace(r"\left(", "(")
-    text = text.replace(r"\right)", ")")
-    text = text.replace(r"\left[", "[")
-    text = text.replace(r"\right]", "]")
-    text = text.replace(r"\left\{", "{")
-    text = text.replace(r"\right\}", "}")
-    text = text.replace(r"\propto", "prop")
-    text = text.replace("propto", "prop")
-    text = text.replace(r"\cdot", "dot.c")
-    text = re.sub(r"(\w)\s+dot\s+(\w)", r"\1 dot.c \2", text)
-    text = text.replace(r"\pm", "plus.minus")
-    text = text.replace(r"\mp", "minus.plus")
-    text = text.replace(r"\otimes", "times.o")
-    text = text.replace("times.circle", "times.o")
-    text = text.replace(r"\oplus", "plus.o")
-    
-    # Convert markdown angle-bracket URLs and DOIs (<https://...>) to Typst #link("...")
-    text = re.sub(r'<(https?://[^>\s]+)>', r'#link("\1")', text)
-    text = re.sub(r'<(doi:[^>\s]+)>', r'#link("\1")', text)
-    text = re.sub(r'<([a-zA-Z0-9_\-\.]+@[a-zA-Z0-9_\-\.]+)>', r'#link("mailto:\1")', text)
 
-    # Convert markdown headers to Typst headers (e.g. ## Title -> == Title)
-    text = re.sub(r"^######\s+(.+)$", r"====== \1", text, flags=re.MULTILINE)
-    text = re.sub(r"^#####\s+(.+)$", r"===== \1", text, flags=re.MULTILINE)
-    text = re.sub(r"^####\s+(.+)$", r"==== \1", text, flags=re.MULTILINE)
-    text = re.sub(r"^###\s+(.+)$", r"=== \1", text, flags=re.MULTILINE)
-    text = re.sub(r"^##\s+(.+)$", r"== \1", text, flags=re.MULTILINE)
-    text = re.sub(r"^#\s+([A-Za-z0-9\"'].*)$", r"= \1", text, flags=re.MULTILINE)
+    # Convert Typst header markers to LaTeX sections if any model hallucinated them
+    text = re.sub(r"^======\s+(.+)$", r"\\paragraph{\1}", text, flags=re.MULTILINE)
+    text = re.sub(r"^=====\s+(.+)$", r"\\subparagraph{\1}", text, flags=re.MULTILINE)
+    text = re.sub(r"^====\s+(.+)$", r"\\subsubsection{\1}", text, flags=re.MULTILINE)
+    text = re.sub(r"^===\s+(.+)$", r"\\subsection{\1}", text, flags=re.MULTILINE)
+    text = re.sub(r"^==\s+(.+)$", r"\\section{\1}", text, flags=re.MULTILINE)
+    text = re.sub(r"^=\s+([A-Za-z0-9\"'].*)$", r"\\chapter{\1}", text, flags=re.MULTILINE)
 
-    text = text.replace("Hom(", '"Hom"(')
-    text = text.replace("ker(", '"ker"(')
-    text = text.replace("dim(", '"dim"(')
+    # Convert Markdown headers if any
+    text = re.sub(r"^###\s+(.+)$", r"\\subsection{\1}", text, flags=re.MULTILINE)
+    text = re.sub(r"^##\s+(.+)$", r"\\section{\1}", text, flags=re.MULTILINE)
+    text = re.sub(r"^#\s+(.+)$", r"\\chapter{\1}", text, flags=re.MULTILINE)
 
-    # Line-by-line math balance: ensure unclosed inline math on a line is closed on that line
-    lines = text.split('\n')
-    fixed_lines = []
-    in_block_math = False
+    # Convert Typst callout syntax if any
+    text = re.sub(r'#theorem\(title:\s*\"([^\"]+)\"\)\[(.*?)\]', r'\\begin{SpringerTheorem}{\1}{thm:\1}\n\2\n\\end{SpringerTheorem}', text, flags=re.DOTALL)
+    text = re.sub(r'#definition\(title:\s*\"([^\"]+)\"\)\[(.*?)\]', r'\\begin{SpringerDefinition}{\1}{def:\1}\n\2\n\\end{SpringerDefinition}', text, flags=re.DOTALL)
+    text = re.sub(r'#remark\(title:\s*\"([^\"]+)\"\)\[(.*?)\]', r'\\begin{SpringerRemark}{\1}{rem:\1}\n\2\n\\end{SpringerRemark}', text, flags=re.DOTALL)
+    text = re.sub(r'#proof\[(.*?)\]', r'\\begin{proof}\n\1\n\\end{proof}', text, flags=re.DOTALL)
+
+    # Normalize standard theorem environments to custom Springer tcolorboxes
+    def _fix_thm(m):
+        env = m.group(1)
+        title = m.group(2).strip("[]{}") if m.group(2) else env.capitalize()
+        body = m.group(3)
+        slug = re.sub(r'[^a-zA-Z0-9]', '_', title)[:20]
+        if "thm" in env.lower() or "theorem" in env.lower():
+            return f"\\begin{{SpringerTheorem}}{{{title}}}{{thm_{slug}}}\n{body}\n\\end{{SpringerTheorem}}"
+        elif "def" in env.lower():
+            return f"\\begin{{SpringerDefinition}}{{{title}}}{{def_{slug}}}\n{body}\n\\end{{SpringerDefinition}}"
+        elif "rem" in env.lower():
+            return f"\\begin{{SpringerRemark}}{{{title}}}{{rem_{slug}}}\n{body}\n\\end{{SpringerRemark}}"
+        return m.group(0)
+
+    text = re.sub(r'\\begin\{(theorem|definition|remark|lemma|proposition)\}(?:\[(.*?)\]|\{(.*?)\})?(.*?)\\end\{\1\}', _fix_thm, text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Ensure SpringerTheorem/SpringerDefinition/SpringerRemark have 2 argument sets
+    text = re.sub(r'\\begin\{SpringerTheorem\}\{([^{}]+)\}(?!\{)', r'\\begin{SpringerTheorem}{\1}{thm_\1}', text)
+    text = re.sub(r'\\begin\{SpringerDefinition\}\{([^{}]+)\}(?!\{)', r'\\begin{SpringerDefinition}{\1}{def_\1}', text)
+    text = re.sub(r'\\begin\{SpringerRemark\}\{([^{}]+)\}(?!\{)', r'\\begin{SpringerRemark}{\1}{rem_\1}', text)
+
+    # Convert Typst bra-kets ($|x chevron.r$) or text to LaTeX bra-kets
+    text = text.replace("chevron.r", r"\rangle")
+    text = text.replace("chevron.l", r"\langle")
+    text = text.replace("times.o", r"\otimes")
+    text = text.replace("dot.c", r"\cdot")
+    text = text.replace("plus.minus", r"\pm")
+    text = text.replace("minus.plus", r"\mp")
+
+    # Convert markdown links
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\\href{\2}{\1}', text)
+    text = re.sub(r'<(https?://[^\s>]+)>', r'\\url{\1}', text)
+
+    # Escape unescaped ampersands outside of table and alignment environments
+    lines = text.split("\n")
+    in_alignment_env = False
+    clean_lines = []
     for line in lines:
-        s = line.strip()
-        if s == '$':
-            in_block_math = not in_block_math
-            fixed_lines.append(line)
+        if any(env in line for env in [r"\begin{align", r"\begin{matrix", r"\begin{pmatrix", r"\begin{bmatrix", r"\begin{tabular", r"\begin{cases", r"\begin{array"]):
+            in_alignment_env = True
+        if any(env in line for env in [r"\end{align", r"\end{matrix", r"\end{pmatrix", r"\end{bmatrix", r"\end{tabular", r"\end{cases", r"\end{array"]):
+            in_alignment_env = False
+            clean_lines.append(line)
             continue
-        if not in_block_math and line.count('$') % 2 != 0:
-            line += ' $'
-        fixed_lines.append(line)
-    text = '\n'.join(fixed_lines)
+        if not in_alignment_env:
+            line = re.sub(r"(?<!\\)&", r"\&", line)
+        clean_lines.append(line)
 
-    # Stack-based delimiter balancing for brackets and parentheses
-    stack = []
-    in_math = False
-    for c in text:
-        if c == '$':
-            in_math = not in_math
-        elif not in_math:
-            if c in '([':
-                stack.append(c)
-            elif c == ')' and stack and stack[-1] == '(':
-                stack.pop()
-            elif c == ']' and stack and stack[-1] == '[':
-                stack.pop()
-
-    res = text
-    if in_math:
-        res += '\n$\n'
-    while stack:
-        b = stack.pop()
-        if b == '[':
-            res += '\n]\n'
-        elif b == '(':
-            res += ')'
-    
-    return res.strip()
+    return "\n".join(clean_lines).strip()
 
 
 def _load_env():
@@ -152,6 +145,8 @@ _load_env()
 class BookEngine:
     def __init__(self):
         self.storage_dir = STORAGE_DIR
+        self.latex_compiler = find_latex_compiler()
+        print(f"[BookEngine] Initialized with LaTeX compiler: {self.latex_compiler}")
         self._ensure_showcase_books()
 
     def _get_genai_client(self, api_key: Optional[str] = None):
@@ -168,7 +163,7 @@ class BookEngine:
             return None
 
     # =========================================================================
-    # Multi-Agent Pipeline Components
+    # Multi-Agent Pipeline Components (LaTeX Focused)
     # =========================================================================
 
     async def run_architect_agent(
@@ -176,32 +171,44 @@ class BookEngine:
         request: GenerateBookRequest,
         client: Any = None
     ) -> BookBlueprint:
-        """Agent 1: The Architect - Generates rigorous structural blueprint."""
+        """Agent 1: The Architect - Generates rigorous structural blueprint with LaTeX notation."""
         if client is not None:
             try:
                 from google.genai import types
-                prompt = f"""
+                prompt_template = r"""
                 You are a world-renowned principal academic textbook architect for Springer Nature and Cambridge University Press.
                 Design a rigorous, publication-grade, multi-chapter academic monograph outline for:
                 
-                Topic: "{request.topic}"
-                Academic Discipline: "{request.discipline}"
-                Publisher Series: "{request.series}"
-                Target Audience: "{request.audience}"
-                Target Chapters: {request.chapter_count}
-                Rigor Level: "{request.rigor_level}"
-                Author: "{request.author}"
-                Affiliation: "{request.affiliation}"
-                Notation Convention: "{request.notation_convention}"
+                Topic: "{topic}"
+                Academic Discipline: "{discipline}"
+                Publisher Series: "{series}"
+                Target Audience: "{audience}"
+                Target Chapters: {chapter_count}
+                Rigor Level: "{rigor_level}"
+                Author: "{author}"
+                Affiliation: "{affiliation}"
+                Notation Convention: "{notation_convention}"
 
                 Requirements:
                 - Create a mathematically grounded progression from fundamentals to advanced frontier theorems.
                 - Each chapter must have an abstract and 3-5 comprehensive sections.
-                - Detail exact equations needed in Typst notation (e.g. $nabla_mu T^(mu nu) = 0$, $d F = 0$).
+                - Detail exact equations needed in standard LaTeX notation (e.g. \nabla_\mu T^{{\mu\nu}} = 0, d F = 0, \Tr(\rho) = 1).
                 - Include formal theorems, lemmas, or definitions to be stated and proved.
                 - Provide a scholarly preface and 5+ foundational bibliography seeds.
                 """
-                response = client.models.generate_content(
+                prompt = prompt_template.format(
+                    topic=request.topic,
+                    discipline=request.discipline,
+                    series=request.series,
+                    audience=request.audience,
+                    chapter_count=request.chapter_count,
+                    rigor_level=request.rigor_level,
+                    author=request.author,
+                    affiliation=request.affiliation,
+                    notation_convention=request.notation_convention
+                )
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
                     model="gemini-2.5-flash",
                     contents=prompt,
                     config=types.GenerateContentConfig(
@@ -214,7 +221,6 @@ class BookEngine:
             except Exception as e:
                 print(f"[ArchitectAgent] GenAI call failed: {e}. Falling back to dynamic blueprint synthesizer.")
 
-        # High-Quality Synthesizer Fallback
         return self._synthesize_blueprint(request)
 
     async def run_writer_agent(
@@ -224,104 +230,78 @@ class BookEngine:
         rigor_level: str,
         client: Any = None
     ) -> str:
-        """Agent 2: The Writer - Concurrently writes complete chapter in Typst."""
+        """Agent 2: The Writer - Concurrently writes complete chapter in LaTeX."""
         if client is not None:
             try:
                 from google.genai import types
-                prompt = f"""
-                You are a senior academic author writing Chapter {chapter.number}: "{chapter.title}" for the Springer monograph:
-                Title: "{blueprint.title}"
-                Subtitle: "{blueprint.subtitle}"
-                Notation Context: "{blueprint.notation_conventions} | {chapter.notation_context}"
+                sections_json = json.dumps([s.model_dump() for s in chapter.sections], indent=2)
+                prompt_template = r"""
+                You are a senior academic author writing Chapter {chapter_num}: "{chapter_title}" for the Springer monograph:
+                Title: "{title}"
+                Subtitle: "{subtitle}"
+                Notation Context: "{notation}"
                 Rigor Level: "{rigor_level}"
 
                 Chapter Abstract:
-                {chapter.abstract}
+                {abstract}
 
                 Sections to author:
-                {json.dumps([s.model_dump() for s in chapter.sections], indent=2)}
+                {sections}
 
                 CRITICAL AUTHORING INSTRUCTIONS:
-                - Write comprehensive, publication-grade academic text in Typst syntax.
-                - Output RAW Typst markup starting with `= {chapter.title}` followed by `#chapter-abstract[{chapter.abstract}]`.
-                - For each section, use `== Section Title` and `=== Subsection Title`.
-                - Use the custom Springer environments provided in the template:
-                  - `#definition(title: "Definition X.Y (Title)")[ ... ]`
-                  - `#theorem(title: "Theorem X.Y (Title)")[ ... ]`
-                  - `#lemma(title: "Lemma X.Y (Title)")[ ... ]`
-                  - `#proof[ ... ]` (with rigorous step-by-step algebraic steps)
-                  - `#example(title: "Example X.Y (Title)")[ ... ]`
-                  - `#remark(title: "Remark X.Y")[ ... ]`
-                - Write equations natively in Typst math syntax:
-                  - Inline math: `$E = m c^2$`
-                  - Block equations: `$ nabla_mu F^(mu nu) = mu_0 J^nu $`
-                  - Numbered/labeled equations: `$ nabla_mu u^mu = 0 <eq:continuity> $`
+                - Write comprehensive, publication-grade academic text in standard LaTeX syntax.
+                - Start directly with: \chapter{{{chapter_title}}}
+                - Follow immediately with a brief chapter introduction and overview paragraph.
+                - For each section, use \section{{Section Title}} and \subsection{{Subsection Title}}.
+                - Use the custom Springer callout environments provided in the template:
+                  - \begin{{SpringerDefinition}}{{Definition Name}}{{def:unique_label}} ... \end{{SpringerDefinition}}
+                  - \begin{{SpringerTheorem}}{{Theorem Name}}{{thm:unique_label}} ... \end{{SpringerTheorem}}
+                  - \begin{{SpringerRemark}}{{Remark Name}}{{rem:unique_label}} ... \end{{SpringerRemark}}
+                  - \begin{{proof}} ... \end{{proof}} (with step-by-step rigorous algebraic steps)
+                - Write equations natively in LaTeX math:
+                  - Inline math: $E = m c^2$
+                  - Display equations: \begin{{equation}} \nabla_\mu F^{{\mu\nu}} = \mu_0 J^\nu \label{{eq:maxwell}} \end{{equation}}
+                  - Aligned multiline math: \begin{{align}} ... \end{{align}}
+                - Use Dirac bra-ket macros: \ket{{\psi}}, \bra{{\phi}}, \braket{{\phi}}{{\psi}}, \ketbra{{\psi}}{{\phi}}, \Tr(\rho).
                 - Provide complete mathematical derivations. DO NOT summarize, hand-wave, or leave "left as an exercise to the reader".
                 - Write high-density, authoritative academic prose.
                 """
-                # Use fast, powerful gemini-2.5-flash
-                try:
-                    response = client.models.generate_content(
-                        model="gemini-2.5-flash",
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.3,
-                        ),
-                    )
-                except Exception as inner_e:
-                    print(f"[WriterAgent] Trying fallback model: {inner_e}")
-                    response = client.models.generate_content(
-                        model="gemini-3.1-pro-preview",
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            temperature=0.3,
-                        ),
-                    )
-                
-                raw_draft = response.text
-                sanitized_draft = sanitize_typst(raw_draft)
-                
-                # Verify individual chapter compiles
-                test_header = f"""#import "backend/templates/springer.typ": book, theorem, definition, lemma, proposition, proof, example, remark, chapter-abstract, hbar
-#show: book.with(title: "{blueprint.title}", author: "{blueprint.author}", affiliation: "Inst", series: "Series", discipline: "Field", preface: [], notation_conventions: [])
-
-{sanitized_draft}
-"""
-                test_tmp = os.path.join(WORKSPACE_ROOT, f"_test_ch_{uuid.uuid4().hex[:6]}.typ")
-                try:
-                    with open(test_tmp, "w", encoding="utf-8") as f:
-                        f.write(test_header)
-                    typst.compile(test_tmp, root=WORKSPACE_ROOT)
-                    return sanitized_draft
-                except Exception as comp_e:
-                    print(f"[WriterAgent] Chapter {chapter.number} had syntax nuance ({comp_e}). Applying second healing pass.")
-                    def _fix_callout_title(m):
-                        t = m.group(2).replace('"', "'")
-                        return f'#{m.group(1)}(title: "{t}")['
-                    repaired = re.sub(r'#([a-zA-Z0-9_\-]+)\s*\(\s*title:\s*\"(.*?)\"\s*\)\s*\[', _fix_callout_title, sanitized_draft)
-                    repaired = sanitize_typst(repaired)
-                    
-                    # Test re-compiled draft
+                prompt = prompt_template.format(
+                    chapter_num=chapter.number,
+                    chapter_title=chapter.title,
+                    title=blueprint.title,
+                    subtitle=blueprint.subtitle,
+                    notation=f"{blueprint.notation_conventions} | {chapter.notation_context}",
+                    rigor_level=rigor_level,
+                    abstract=chapter.abstract,
+                    sections=sections_json
+                )
+                def _generate_writer_content():
                     try:
-                        with open(test_tmp, "w", encoding="utf-8") as f:
-                            f.write(f"""#import "backend/templates/springer.typ": book, theorem, definition, lemma, proposition, proof, example, remark, chapter-abstract, hbar
-#show: book.with(title: "{blueprint.title}", author: "{blueprint.author}", affiliation: "Inst", series: "Series", discipline: "Field", preface: [], notation_conventions: [])
-
-{repaired}
-""")
-                        typst.compile(test_tmp, root=WORKSPACE_ROOT)
-                        return repaired
-                    except Exception as second_comp_e:
-                        print(f"[WriterAgent] Chapter {chapter.number} second pass failed ({second_comp_e}). Using verified dynamic synthesizer.")
-                        return self._synthesize_chapter(blueprint, chapter, rigor_level)
-                finally:
-                    if os.path.exists(test_tmp):
-                        os.remove(test_tmp)
-
+                        return client.models.generate_content(
+                            model="gemini-2.5-flash",
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                temperature=0.3,
+                            ),
+                        )
+                    except Exception as inner_e:
+                        print(f"[WriterAgent] Trying fallback model: {inner_e}")
+                        return client.models.generate_content(
+                            model="gemini-3.1-pro-preview",
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                temperature=0.3,
+                            ),
+                        )
+                
+                response = await asyncio.to_thread(_generate_writer_content)
+                raw_draft = response.text
+                return sanitize_latex(raw_draft)
             except Exception as e:
-                print(f"[WriterAgent] Chapter {chapter.number} GenAI call failed: {e}. Synthesizing academic chapter.")
+                print(f"[WriterAgent] Error in GenAI generation: {e}. Falling back to dynamic chapter synthesizer.")
 
-        return self._synthesize_chapter(blueprint, chapter, rigor_level)
+        return sanitize_latex(self._synthesize_chapter(blueprint, chapter, rigor_level))
 
     async def run_reviewer_agent(
         self,
@@ -329,33 +309,34 @@ class BookEngine:
         chapter_drafts: List[str],
         client: Any = None
     ) -> Dict[str, Any]:
-        """Agent 3: The Reviewer - Validates cross-chapter coherence, notation, and bibliography."""
+        """Agent 3: The Reviewer - Validates cross-chapter coherence, notation, and LaTeX bibliography."""
         if client is not None:
             try:
                 from google.genai import types
-                prompt = f"""
+                prompt_template = r"""
                 You are the Chief Academic Editor and Reviewer for Springer Nature.
                 Review this newly generated monograph:
-                Title: "{blueprint.title}"
-                Chapters: {len(chapter_drafts)}
-                Notation: "{blueprint.notation_conventions}"
+                Title: "{title}"
+                Chapters: {chapter_count}
+                Notation: "{notation}"
 
                 Perform editorial normalization:
                 1. Verify consistent equation notation across all chapters.
                 2. Check cross-chapter references and terminology alignment.
-                3. Compile a normalized, comprehensive Springer-format bibliography with 8+ seminal references as a Typst numbered list (+ Author (Year). Title...).
-                
-                IMPORTANT: For "bibliography_typst", output ONLY a raw Typst numbered list using `+ `, like:
-                + Author, A., & Coauthor, B. (Year). *Title of Book*. Publisher.
-                + Author, C. (Year). Title of Article. *Journal Name*, 1(2), 100-120.
-                Do NOT output #let, code arrays, dictionaries, or angle brackets around URLs.
+                3. Compile a normalized, comprehensive Springer-format LaTeX bibliography with 8+ seminal references as a \begin{{thebibliography}}{{99}} environment with \bibitem{{key}} entries.
 
                 Return JSON with:
                 - "coherence_score": (int 1-100)
                 - "editorial_notes": (list of string feedback)
-                - "bibliography_typst": (string of formatted Typst numbered bibliography entries)
+                - "bibliography_latex": (string of formatted \begin{{thebibliography}}...\end{{thebibliography}})
                 """
-                response = client.models.generate_content(
+                prompt = prompt_template.format(
+                    title=blueprint.title,
+                    chapter_count=len(chapter_drafts),
+                    notation=blueprint.notation_conventions
+                )
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
                     model="gemini-2.5-flash",
                     contents=prompt,
                     config=types.GenerateContentConfig(
@@ -370,9 +351,9 @@ class BookEngine:
                     clean_text = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw_text)
                     res = json.loads(clean_text, strict=False)
                 
-                bib = res.get("bibliography_typst", "")
-                if not bib or "#let" in bib or "+" not in bib:
-                    res["bibliography_typst"] = self._generate_bibliography_typst(blueprint)
+                bib = res.get("bibliography_latex", "")
+                if not bib or "\\bibitem" not in bib:
+                    res["bibliography_latex"] = self._generate_bibliography_latex(blueprint)
                 return res
             except Exception as e:
                 print(f"[ReviewerAgent] GenAI call failed: {e}. Using deterministic editorial normalization.")
@@ -385,128 +366,157 @@ class BookEngine:
                 "Proof steps validated against standard differential geometry conventions.",
                 "Bibliography harmonized with Springer Graduate Texts citation style."
             ],
-            "bibliography_typst": self._generate_bibliography_typst(blueprint)
+            "bibliography_latex": self._generate_bibliography_latex(blueprint)
         }
 
     # =========================================================================
-    # Typst Master Assembly & Compilation
+    # LaTeX Master Assembly & Compilation
     # =========================================================================
 
     def assemble_master_document(
         self,
         blueprint: BookBlueprint,
         chapter_drafts: List[str],
-        bibliography_typst: str
+        bibliography_latex: str = ""
     ) -> str:
-        """Assembles the complete master Typst file using the Springer template."""
-        template_rel_path = "backend/templates/springer.typ"
-        
-        def clean_header_str(s: Any) -> str:
-            return str(s or "").replace('"', "'").strip()
+        """Assembles the complete master LaTeX document with Springer styling."""
+        template_file = os.path.join(TEMPLATES_DIR, "springer_monograph.tex")
+        if os.path.exists(template_file):
+            with open(template_file, "r", encoding="utf-8") as f:
+                preamble = f.read()
+        else:
+            preamble = r"""\documentclass[11pt,a4paper,openany]{book}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,amsthm,mathtools}
+\usepackage{geometry}
+\geometry{top=2.5cm, bottom=2.5cm, left=2.8cm, right=2.8cm, headheight=14pt}
+\usepackage{xcolor}
+\usepackage[most]{tcolorbox}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{hyperref}
+"""
 
-        preface_content = blueprint.preface if blueprint.preface else f"""
-This monograph presents an axiomatic, pedagogical exposition of *{clean_header_str(blueprint.title)}*.
-The primary objective is to bridge the conceptual gap between introductory graduate coursework and current research literature in {clean_header_str(blueprint.discipline)}.
+        clean_title = blueprint.title.replace("&", "\\&").replace("_", "\\_")
+        clean_subtitle = blueprint.subtitle.replace("&", "\\&").replace("_", "\\_")
+        clean_author = blueprint.author.replace("&", "\\&")
+        clean_affiliation = (blueprint.affiliation or "Institute for Advanced Study").replace("&", "\\&")
+        clean_series = (blueprint.series or "Springer Graduate Texts").replace("&", "\\&")
+        clean_dedication = (blueprint.dedication or "To the pursuit of scientific knowledge.").replace("&", "\\&")
+
+        raw_preface = blueprint.preface if blueprint.preface else f"""
+This monograph presents an axiomatic, pedagogical exposition of \\textbf{{{clean_title}}}.
+The primary objective is to bridge the conceptual gap between introductory graduate coursework and current research literature in {blueprint.discipline}.
 Each chapter develops the theoretical framework from foundational principles, followed by complete derivations and rigorous theorems.
 """
 
-        notation_content = blueprint.notation_conventions if blueprint.notation_conventions else """
+        raw_notation = blueprint.notation_conventions if blueprint.notation_conventions else r"""
 We adhere to standard international conventions for theoretical physics and mathematics:
-- Metric tensor signature $(- , + , + , +)$ in Lorentzian spacetime manifolds.
-- Greek indices $mu, nu, rho$ denote spacetime dimensions.
-- Roman indices $i, j, k$ indicate spatial coordinates.
-- Summation convention: Repeated indices imply summation over the full coordinate range.
+\begin{itemize}
+    \item Metric tensor signature $(-, +, +, +)$ in Lorentzian spacetime manifolds.
+    \item Greek indices $\mu, \nu, \rho$ denote spacetime dimensions ($0, 1, 2, 3$).
+    \item Roman indices $i, j, k$ indicate spatial coordinates ($1, 2, 3$).
+    \item Summation convention: Repeated upper and lower indices imply Einstein summation.
+    \item Quantum mechanical density matrices satisfy $\Tr(\rho) = 1$ with $\rho \ge 0$.
+\end{itemize}
 """
-        # Ensure preface, notation, and bibliography are sanitized
-        clean_preface = sanitize_typst(preface_content)
-        clean_notation = sanitize_typst(notation_content)
-        clean_bib = sanitize_typst(bibliography_typst) if bibliography_typst else self._generate_bibliography_typst(blueprint)
+        preface_text = sanitize_latex(raw_preface)
+        notation_text = sanitize_latex(raw_notation)
+        clean_bib = bibliography_latex if bibliography_latex else self._generate_bibliography_latex(blueprint)
+        chapters_body = "\n\n".join(sanitize_latex(ch) for ch in chapter_drafts)
 
-        doc_header = f"""// Master Typst Document generated by Nisse Book Maker
-// Title: {clean_header_str(blueprint.title)}
-// Author: {clean_header_str(blueprint.author)}
+        doc = f"""{preamble}
 
-#import "{template_rel_path}": book, theorem, definition, lemma, proposition, proof, example, remark, chapter-abstract, hbar
+\\begin{{document}}
 
-#show: book.with(
-  title: "{clean_header_str(blueprint.title)}",
-  subtitle: "{clean_header_str(blueprint.subtitle)}",
-  author: "{clean_header_str(blueprint.author)}",
-  affiliation: "{clean_header_str(blueprint.affiliation)}",
-  series: "{clean_header_str(blueprint.series)}",
-  discipline: "{clean_header_str(blueprint.discipline)}",
-  edition: "{clean_header_str(blueprint.edition)}",
-  dedication: "{clean_header_str(blueprint.dedication)}",
-  preface: [
-{clean_preface}
-  ],
-  notation_conventions: [
-{clean_notation}
-  ]
-)
+% Title Page
+\\begin{{titlepage}}
+\\begin{{center}}
+\\vspace*{{2cm}}
+{{\\color{{springeraccent}}\\textsc{{\\Large {clean_series}}}}}\\\\[1.5cm]
+{{\\Huge\\bfseries\\color{{springerblue}} {clean_title}}}\\\\[0.5cm]
+{{\\Large\\itshape {clean_subtitle}}}\\\\[2cm]
+{{\\Large\\textbf{{{clean_author}}}}}\\\\[0.3cm]
+{{\\large {clean_affiliation}}}\\\\[3cm]
+\\vfill
+{{\\large Springer Nature --- First Edition --- 2026}}
+\\end{{center}}
+\\end{{titlepage}}
 
-"""
-        # Join chapters with page breaks
-        body_content = "\n\n".join(chapter_drafts)
+\\frontmatter
 
-        # Append bibliography
-        bib_section = f"""
+% Dedication
+\\cleardoublepage
+\\vspace*{{4cm}}
+\\begin{{center}}
+\\textit{{{clean_dedication}}}
+\\end{{center}}
+\\vfill
 
-= References and Bibliography
+\\tableofcontents
 
-#line(length: 100%, stroke: 0.5pt + rgb("#cbd5e1"))
-#v(1em)
+\\chapter{{Preface}}
+{preface_text.strip()}
+
+\\chapter{{Notation and Conventions}}
+{notation_text.strip()}
+
+\\mainmatter
+
+{chapters_body}
+
+\\backmatter
 
 {clean_bib}
+
+\\end{{document}}
 """
-        return doc_header + body_content + bib_section
+        return doc
 
     def compile_document(
         self,
-        typst_source: str,
+        latex_source: str,
         output_pdf_path: str
     ) -> bytes:
-        """Compiles Typst source code to PDF with sub-second performance and auto-repair."""
-        temp_src_path = os.path.join(WORKSPACE_ROOT, f"_temp_compile_{uuid.uuid4().hex[:8]}.typ")
-        try:
-            with open(temp_src_path, "w", encoding="utf-8") as f:
-                f.write(typst_source)
+        """Compiles LaTeX source code directly to PDF with sub-second performance using Tectonic / LuaLaTeX."""
+        compiler = find_latex_compiler()
+        clean_source = sanitize_latex(latex_source)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tex_file = os.path.join(tmpdir, "document.tex")
+            pdf_file = os.path.join(tmpdir, "document.pdf")
             
-            try:
-                pdf_bytes = typst.compile(temp_src_path, root=WORKSPACE_ROOT)
-            except Exception as first_err:
-                print(f"[TypstCompiler] Initial compilation failed: {first_err}. Attempting auto-repair pass...")
-                # Auto-repair pass: sanitize again and balance delimiters
-                repaired_source = sanitize_typst(typst_source)
-                
-                # Check for unclosed square brackets across entire document
-                open_brackets = repaired_source.count("[")
-                close_brackets = repaired_source.count("]")
-                if open_brackets > close_brackets:
-                    repaired_source += "\n" + ("]\n" * (open_brackets - close_brackets))
+            with open(tex_file, "w", encoding="utf-8") as f:
+                f.write(clean_source)
 
-                with open(temp_src_path, "w", encoding="utf-8") as f:
-                    f.write(repaired_source)
-                
-                try:
-                    pdf_bytes = typst.compile(temp_src_path, root=WORKSPACE_ROOT)
-                except Exception as second_err:
-                    print(f"[TypstCompiler] Auto-repair failed: {second_err}. Fallback to robust normalized source.")
-                    # Final safe normalization fallback: strip any unescaped loose delimiters
-                    safe_source = re.sub(r"#([a-zA-Z0-9_\-]+)\s*\((.*?)\)\s*\[", r"#\1(\2) [", repaired_source)
-                    with open(temp_src_path, "w", encoding="utf-8") as f:
-                        f.write(safe_source)
-                    pdf_bytes = typst.compile(temp_src_path, root=WORKSPACE_ROOT)
-            
-            # Save output PDF
-            os.makedirs(os.path.dirname(output_pdf_path), exist_ok=True)
+            # Build command
+            if "tectonic" in compiler:
+                cmd = [compiler, "document.tex"]
+            else:
+                cmd = [compiler, "-interaction=nonstopmode", "-halt-on-error", "document.tex"]
+
+            res = subprocess.run(cmd, cwd=tmpdir, capture_output=True, text=True)
+
+            if not os.path.exists(pdf_file):
+                print(f"[LaTeXCompiler] Compile pass failed ({res.stderr[:200]}). Attempting emergency repair...")
+                # Second pass with aggressive sanitization
+                repaired = sanitize_latex(clean_source)
+                with open(tex_file, "w", encoding="utf-8") as f:
+                    f.write(repaired)
+                res2 = subprocess.run(cmd, cwd=tmpdir, capture_output=True, text=True)
+                if not os.path.exists(pdf_file):
+                    raise RuntimeError(f"LaTeX compilation failed:\n{res2.stderr}\n{res2.stdout[-500:]}")
+
+            with open(pdf_file, "rb") as f:
+                pdf_bytes = f.read()
+
+            out_dir = os.path.dirname(output_pdf_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
             with open(output_pdf_path, "wb") as f:
                 f.write(pdf_bytes)
-            
+
             return pdf_bytes
-        finally:
-            if os.path.exists(temp_src_path):
-                os.remove(temp_src_path)
 
     # =========================================================================
     # SSE Stream Generation Workflow
@@ -519,6 +529,7 @@ We adhere to standard international conventions for theoretical physics and math
         """Streaming generator emitting real-time progress events for the Next.js UI."""
         book_id = f"book_{uuid.uuid4().hex[:10]}"
         client = None if request.use_simulation else self._get_genai_client(request.api_key)
+        compiler_name = os.path.basename(self.latex_compiler)
         
         # 1. Pipeline Start
         yield self._sse_event("pipeline_start", {
@@ -526,7 +537,7 @@ We adhere to standard international conventions for theoretical physics and math
             "topic": request.topic,
             "author": request.author,
             "series": request.series,
-            "engine": "Gemini 2.5 Pro + Typst Compiler" if client else "Deterministic High-Fidelity Synthesizer + Typst"
+            "engine": f"Gemini 2.5 Pro + LaTeX ({compiler_name})" if client else f"Deterministic High-Fidelity Synthesizer + LaTeX ({compiler_name})"
         })
         await asyncio.sleep(0.5)
 
@@ -537,7 +548,7 @@ We adhere to standard international conventions for theoretical physics and math
             "total_stages": 4,
             "status": "active",
             "message": f"Analyzing academic topic: '{request.topic}'",
-            "log": f"Architect Agent synthesizing table of contents, chapter taxonomy, and notation contracts..."
+            "log": f"Architect Agent synthesizing LaTeX table of contents, chapter taxonomy, and notation contracts..."
         })
         await asyncio.sleep(0.8)
 
@@ -557,42 +568,55 @@ We adhere to standard international conventions for theoretical physics and math
             "stage": 2,
             "total_stages": 4,
             "status": "active",
-            "message": f"Authoring {len(blueprint.chapters)} chapters concurrently in Typst...",
-            "log": f"Spawning {len(blueprint.chapters)} concurrent academic author agents with model gemini-2.5-pro..."
+            "message": f"Authoring {len(blueprint.chapters)} chapters concurrently in LaTeX...",
+            "log": f"Spawning {len(blueprint.chapters)} concurrent academic author agents with model gemini-2.5-flash..."
         })
 
         chapter_drafts = [""] * len(blueprint.chapters)
 
-        async def write_single_chapter(index: int, ch: ChapterOutline):
-            yield_events = []
-            yield_events.append(("agent_log", {
+        for i, ch in enumerate(blueprint.chapters):
+            yield self._sse_event("agent_log", {
                 "agent": f"Writer {ch.number}",
-                "chapter_index": index,
-                "message": f"Drafting Chapter {ch.number}: {ch.title} with {len(ch.sections)} sections...",
+                "chapter_index": i,
+                "message": f"Drafting Chapter {ch.number}: {ch.title} with {len(ch.sections)} sections in LaTeX...",
                 "status": "drafting"
-            }))
-            
+            })
+
+        async def _author_chapter(index: int, ch: ChapterOutline):
             draft = await self.run_writer_agent(blueprint, ch, request.rigor_level, client)
             chapter_drafts[index] = draft
-            
-            yield_events.append(("chapter_complete", {
-                "chapter_index": index,
-                "chapter_number": ch.number,
-                "title": ch.title,
-                "draft_preview": draft[:300] + "...",
-                "status": "completed"
-            }))
-            return yield_events
+            return index, ch, draft
 
-        # Run concurrent writer tasks
-        writer_tasks = [write_single_chapter(i, ch) for i, ch in enumerate(blueprint.chapters)]
-        for task_coro in writer_tasks:
-            events = await task_coro
-            for event_name, event_data in events:
-                yield self._sse_event(event_name, event_data)
-                await asyncio.sleep(0.3)
+        pending_tasks = [asyncio.create_task(_author_chapter(i, ch)) for i, ch in enumerate(blueprint.chapters)]
+        pending = set(pending_tasks)
+        start_time = time.time()
 
-        await asyncio.sleep(0.5)
+        while pending:
+            done, pending = await asyncio.wait(pending, timeout=2.5, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                idx, ch, draft = t.result()
+                yield self._sse_event("chapter_complete", {
+                    "chapter_index": idx,
+                    "chapter_number": ch.number,
+                    "title": ch.title,
+                    "draft_preview": draft[:300] + "...",
+                    "status": "completed"
+                })
+                yield self._sse_event("agent_log", {
+                    "agent": f"Writer {ch.number}",
+                    "chapter_index": idx,
+                    "message": f"Finished authoring Chapter {ch.number}: \"{ch.title}\"",
+                    "status": "completed"
+                })
+            if pending:
+                elapsed = int(time.time() - start_time)
+                yield self._sse_event("agent_log", {
+                    "agent": "Writer Agents (Parallel)",
+                    "message": f"Synthesizing LaTeX sections & proofs in parallel ({elapsed}s elapsed, {len(pending)} chapters in flight)...",
+                    "status": "active"
+                })
+
+        await asyncio.sleep(0.3)
 
         # 4. Stage 3: Reviewer Agent
         yield self._sse_event("agent_status", {
@@ -603,64 +627,76 @@ We adhere to standard international conventions for theoretical physics and math
             "message": "Reviewing notation consistency, cross-references, and theorem structures...",
             "log": "Reviewer Agent normalizing indices, tensor conventions, theorem labels, and compiling references..."
         })
-        await asyncio.sleep(0.8)
 
-        review_result = await self.run_reviewer_agent(blueprint, chapter_drafts, client)
+        reviewer_task = asyncio.create_task(self.run_reviewer_agent(blueprint, chapter_drafts, client))
+        rev_start = time.time()
+        while not reviewer_task.done():
+            try:
+                review_result = await asyncio.wait_for(asyncio.shield(reviewer_task), timeout=2.5)
+            except asyncio.TimeoutError:
+                elapsed_rev = int(time.time() - rev_start)
+                yield self._sse_event("agent_log", {
+                    "agent": "Reviewer & Editor Agent",
+                    "message": f"Validating theorem consistency, cross-references, and bibliography ({elapsed_rev}s)...",
+                    "status": "active"
+                })
+        review_result = reviewer_task.result()
         
         yield self._sse_event("review_ready", {
             "coherence_score": review_result.get("coherence_score", 98),
             "editorial_notes": review_result.get("editorial_notes", []),
             "log": f"Peer review complete. Coherence score: {review_result.get('coherence_score', 98)}/100."
         })
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
-        # 5. Stage 4: Typst Compilation & PDF Rendering
+        # 5. Stage 4: LaTeX Compilation & PDF Rendering
         yield self._sse_event("agent_status", {
-            "agent": "Typst Compilation Engine",
+            "agent": "LaTeX Compilation Engine",
             "stage": 4,
             "total_stages": 4,
             "status": "active",
-            "message": "Compiling master Typst source into publication-grade Springer PDF...",
-            "log": "Executing deterministic sub-second Typst compilation..."
+            "message": f"Compiling master LaTeX source into publication-grade Springer PDF via {compiler_name}...",
+            "log": f"Executing deterministic LaTeX compilation with {compiler_name}..."
         })
 
         t0 = time.time()
-        master_typst = self.assemble_master_document(
+        master_latex = self.assemble_master_document(
             blueprint=blueprint,
             chapter_drafts=chapter_drafts,
-            bibliography_typst=review_result.get("bibliography_typst", "")
+            bibliography_latex=review_result.get("bibliography_latex", "")
         )
 
         book_folder = os.path.join(self.storage_dir, book_id)
         os.makedirs(book_folder, exist_ok=True)
         pdf_path = os.path.join(book_folder, "book.pdf")
-        typst_path = os.path.join(book_folder, "master.typ")
+        latex_path = os.path.join(book_folder, "master.tex")
         meta_path = os.path.join(book_folder, "metadata.json")
 
+        with open(latex_path, "w", encoding="utf-8") as f:
+            f.write(master_latex)
+
         try:
-            pdf_bytes = self.compile_document(master_typst, pdf_path)
+            pdf_bytes = self.compile_document(master_latex, pdf_path)
         except Exception as comp_err:
-            print(f"[BookEngine] Compilation error: {comp_err}. Attempting fallback compilation...")
-            # Emergency fallback: synthesize clean chapters for broken sections
+            print(f"[BookEngine] Primary LaTeX compilation failed: {comp_err}. Attempting fallback compilation...")
             clean_drafts = [self._synthesize_chapter(blueprint, ch, request.rigor_level) for ch in blueprint.chapters]
-            master_typst = self.assemble_master_document(
+            master_latex = self.assemble_master_document(
                 blueprint=blueprint,
                 chapter_drafts=clean_drafts,
-                bibliography_typst=review_result.get("bibliography_typst", "")
+                bibliography_latex=review_result.get("bibliography_latex", "")
             )
-            with open(typst_path, "w", encoding="utf-8") as f:
-                f.write(master_typst)
-            pdf_bytes = self.compile_document(master_typst, pdf_path)
+            with open(latex_path, "w", encoding="utf-8") as f:
+                f.write(master_latex)
+            pdf_bytes = self.compile_document(master_latex, pdf_path)
 
         compile_duration_ms = int((time.time() - t0) * 1000)
-
-        # Estimate page count from PDF size or typst query
-        page_count = max(len(blueprint.chapters) * 4 + 4, len(pdf_bytes) // 7000)
+        page_count = max(len(blueprint.chapters) * 4 + 4, len(pdf_bytes) // 6000)
 
         book_detail = BookDetail(
             id=book_id,
             blueprint=blueprint,
-            master_typst=master_typst,
+            master_typst=master_latex,
+            master_latex=master_latex,
             chapter_drafts=chapter_drafts,
             created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
             status="completed",
@@ -672,7 +708,8 @@ We adhere to standard international conventions for theoretical physics and math
                 "coherence_score": review_result.get("coherence_score", 98),
                 "series": blueprint.series,
                 "discipline": blueprint.discipline,
-                "author": blueprint.author
+                "author": blueprint.author,
+                "compiler": compiler_name
             }
         )
 
@@ -732,20 +769,25 @@ We adhere to standard international conventions for theoretical physics and math
     def get_book(self, book_id: str) -> Optional[BookDetail]:
         folder_path = os.path.join(self.storage_dir, book_id)
         meta_path = os.path.join(folder_path, "metadata.json")
+        latex_path = os.path.join(folder_path, "master.tex")
         typst_path = os.path.join(folder_path, "master.typ")
         if not os.path.exists(meta_path):
             return None
         with open(meta_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if os.path.exists(typst_path):
+        if os.path.exists(latex_path):
+            with open(latex_path, "r", encoding="utf-8") as f:
+                data["master_latex"] = f.read()
+                data["master_typst"] = data["master_latex"]
+        elif os.path.exists(typst_path):
             with open(typst_path, "r", encoding="utf-8") as f:
                 data["master_typst"] = f.read()
         return BookDetail.model_validate(data)
 
-    def recompile_book(self, book_id: str, new_typst: str) -> BookDetail:
+    def recompile_book(self, book_id: str, new_source: str) -> BookDetail:
         folder_path = os.path.join(self.storage_dir, book_id)
         meta_path = os.path.join(folder_path, "metadata.json")
-        typst_path = os.path.join(folder_path, "master.typ")
+        latex_path = os.path.join(folder_path, "master.tex")
         pdf_path = os.path.join(folder_path, "book.pdf")
         
         if not os.path.exists(meta_path):
@@ -755,14 +797,14 @@ We adhere to standard international conventions for theoretical physics and math
             data = json.load(f)
 
         t0 = time.time()
-        # Compile new source
-        pdf_bytes = self.compile_document(new_typst, pdf_path)
+        pdf_bytes = self.compile_document(new_source, pdf_path)
         compile_ms = int((time.time() - t0) * 1000)
 
-        with open(typst_path, "w", encoding="utf-8") as f:
-            f.write(new_typst)
+        with open(latex_path, "w", encoding="utf-8") as f:
+            f.write(new_source)
 
-        data["master_typst"] = new_typst
+        data["master_latex"] = new_source
+        data["master_typst"] = new_source
         data["pdf_size_bytes"] = len(pdf_bytes)
         data["metadata"]["last_recompile_ms"] = compile_ms
         data["metadata"]["recompile_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -773,7 +815,7 @@ We adhere to standard international conventions for theoretical physics and math
         return BookDetail.model_validate(data)
 
     # =========================================================================
-    # High-Rigor Academic Synthesizer & Showcase Books
+    # High-Rigor Academic Synthesizer & Showcase Books (LaTeX Native)
     # =========================================================================
 
     def _synthesize_blueprint(self, request: GenerateBookRequest) -> BookBlueprint:
@@ -781,79 +823,64 @@ We adhere to standard international conventions for theoretical physics and math
         topic = request.topic.strip()
         topic_lower = topic.lower()
 
-        # Clean title & generate subtitle
         clean_title = topic
         if len(clean_title) > 60:
             clean_title = clean_title[:60].rsplit(' ', 1)[0]
-        # Title case if needed
         clean_title = ' '.join(w.capitalize() if not w.isupper() else w for w in clean_title.split())
-
-        subtitle = f"Theoretical Foundations, Mathematical Rigor, and Advanced Analytical Methods"
+        subtitle = "Theoretical Foundations, Mathematical Rigor, and Advanced Analytical Methods"
         
-        # Domain detection
         if any(w in topic_lower for w in ["quantum", "qubit", "spin", "entangle", "hilbert"]):
             discipline = "Quantum Physics & Information"
             series = request.series or "Springer Monographs in Quantum Science"
-            notation = "Hilbert spaces $cal(H)$; density matrices $rho$; Pauli group $cal(G)_n$; Dirac bra-ket $|psi chevron.r, chevron.l phi|$."
+            notation = r"Hilbert spaces $\mathcal{H}$; density matrices $\rho$; Pauli group $\mathcal{P}_n$; Dirac notation $|\psi\rangle, \langle\phi|$."
             equations_set = [
-                ["rho = sum_i p_i |psi_i chevron.r chevron.l psi_i|", "cal(E)(rho) = sum_k E_k rho E_k^dagger"],
-                ["S(rho) = - tr(rho log_2 rho)", "S(A B C) + S(B) <= S(A B) + S(B C)"],
-                ["cal(S) = chevron.l g_1, g_2, dots, g_(n-k) chevron.r", "P E_a^dagger E_b P = C_(a b) P"],
-                ["H = - J_e sum_s A_s - J_m sum_p B_p", "p_(\"th\") approx 10.9%"],
-                ["U_L in cal(C)_k", "epsilon_(\"out\") = 35 epsilon_(\"in\")^3"]
+                [r"\rho = \sum_i p_i |\psi_i\rangle\langle\psi_i|", r"\mathcal{E}(\rho) = \sum_k E_k \rho E_k^\dagger"],
+                [r"S(\rho) = - \Tr(\rho \log_2 \rho)", r"S(A B C) + S(B) \le S(A B) + S(B C)"],
+                [r"\mathcal{S} = \langle g_1, g_2, \dots, g_{n-k} \rangle", r"P E_a^\dagger E_b P = C_{ab} P"],
+                [r"H = - J_e \sum_s A_s - J_m \sum_p B_p", r"p_{\mathrm{th}} \approx 10.9\%"],
+                [r"U_L \in \mathcal{C}_k", r"\epsilon_{\mathrm{out}} = 35 \epsilon_{\mathrm{in}}^3"]
             ]
         elif any(w in topic_lower for w in ["learn", "ai", "neural", "deep", "diffusion", "graph", "transformer"]):
             discipline = "Machine Learning & Mathematical Foundations"
             series = request.series or "Springer Monographs in Mathematics and Computing"
-            notation = "Probability space $(Omega, cal(F), bb(P))$; expectation $bb(E)_(x tilde p)[f(x)]$; Lie group representations $rho(g)$."
+            notation = r"Probability space $(\Omega, \mathcal{F}, \mathbb{P})$; expectation $\mathbb{E}_{x \sim p}[f(x)]$; Lie group representations $\rho(g)$."
             equations_set = [
-                ["D_(\"KL\")(q || p) = integral q(x) ln((q(x))/(p(x))) dif x", "log p_theta(x) >= bb(E)[log p_theta(x|z)] - D_(\"KL\")"],
-                ["dif X_t = f(X_t, t) dif t + g(t) dif W_t", "cal(L)_(\"SM\") = bb(E)[1/2 ||s_theta(x, t) - nabla_x log p_t(x)||^2]"],
-                ["Phi(rho_(\"in\")(g) x) = rho_(\"out\")(g) Phi(x)", "(K * f)(p) = integral_(T_p M) K(v) P f(exp_p(v)) dif v"],
-                ["hat(s)(x, c) = (1 + gamma) s(x, c) - gamma s(x, emptyset)", "W_1(p, q) = sup_(||f||_L <= 1) bb(E)_p[f(x)] - bb(E)_q[f(y)]"]
+                [r"D_{\mathrm{KL}}(q \parallel p) = \int q(x) \ln\frac{q(x)}{p(x)} \, dx", r"\log p_\theta(x) \ge \mathbb{E}[\log p_\theta(x|z)] - D_{\mathrm{KL}}"],
+                [r"dX_t = f(X_t, t) \, dt + g(t) \, dW_t", r"\mathcal{L}_{\mathrm{SM}} = \mathbb{E}\left[\frac{1}{2} \|s_\theta(x, t) - \nabla_x \log p_t(x)\|^2\right]"],
+                [r"\Phi(\rho_{\mathrm{in}}(g) x) = \rho_{\mathrm{out}}(g) \Phi(x)", r"(K * f)(p) = \int_{T_p M} K(v) P f(\exp_p(v)) \, dv"],
+                [r"\hat{s}(x, c) = (1 + \gamma) s(x, c) - \gamma s(x, \emptyset)", r"W_1(p, q) = \sup_{\|f\|_L \le 1} \mathbb{E}_p[f(x)] - \mathbb{E}_q[f(y)]"]
             ]
         elif any(w in topic_lower for w in ["relativity", "gravity", "spacetime", "manifold", "black hole", "cosmology"]):
             discipline = "Theoretical Physics & Differential Geometry"
             series = request.series or "Graduate Texts in Contemporary Physics"
-            notation = "Metric signature $(-,+,+,+)$; Greek indices $mu, nu in {0,1,2,3}$; natural units $c = G = hbar = 1$."
+            notation = r"Metric signature $(-,+,+,+)$; Greek indices $\mu, \nu \in \{0,1,2,3\}$; natural units $c = G = \hbar = 1$."
             equations_set = [
-                ["Gamma_(mu nu)^lambda = 1/2 g^(lambda sigma) (partial_mu g_(nu sigma) + partial_nu g_(mu sigma) - partial_sigma g_(mu nu))", "nabla_lambda g_(mu nu) = 0"],
-                ["[nabla_mu, nabla_nu] V^lambda = R^lambda_(sigma mu nu) V^sigma", "G_(mu nu) + Lambda g_(mu nu) = 8 pi T_(mu nu)"],
-                ["dif s^2 = - (1 - (2 M)/r) dif t^2 + (1 - (2 M)/r)^(-1) dif r^2 + r^2 dif Omega^2", "P_(\"GW\") = (G)/(5 c^5) chevron.l dot.double(I)_(j k) dot.double(I)^(j k) chevron.r"],
-                ["(dif theta)/(dif lambda) = - 1/2 theta^2 - sigma_(mu nu) sigma^(mu nu) - R_(mu nu) k^mu k^nu", "S_(\"BH\") = (k_B c^3 A)/(4 G hbar) = A/4"]
+                [r"\Gamma_{\mu\nu}^\lambda = \frac{1}{2} g^{\lambda\sigma} (\partial_\mu g_{\nu\sigma} + \partial_\nu g_{\mu\sigma} - \partial_\sigma g_{\mu\nu})", r"\nabla_\lambda g_{\mu\nu} = 0"],
+                [r"[\nabla_\mu, \nabla_\nu] V^\lambda = R^\lambda{}_{\sigma\mu\nu} V^\sigma", r"G_{\mu\nu} + \Lambda g_{\mu\nu} = 8\pi T_{\mu\nu}"],
+                [r"ds^2 = - \left(1 - \frac{2M}{r}\right) dt^2 + \left(1 - \frac{2M}{r}\right)^{-1} dr^2 + r^2 d\Omega^2", r"P_{\mathrm{GW}} = \frac{G}{5 c^5} \langle \ddot{I}_{jk} \ddot{I}^{jk} \rangle"],
+                [r"\frac{d\theta}{d\lambda} = - \frac{1}{2} \theta^2 - \sigma_{\mu\nu} \sigma^{\mu\nu} - R_{\mu\nu} k^\mu k^\nu", r"S_{\mathrm{BH}} = \frac{k_B c^3 A}{4 G \hbar} = \frac{A}{4}"]
             ]
         elif any(w in topic_lower for w in ["math", "algebra", "topology", "geometry", "category", "number"]):
             discipline = "Pure & Applied Mathematics"
             series = request.series or "Graduate Texts in Mathematics"
-            notation = "Category $cal(C)$; morphism class $\"Hom\"(A, B)$; topological space $(X, tau)$; algebraic ring $(R, +, times)$."
+            notation = r"Category $\mathcal{C}$; morphism class $\operatorname{Hom}(A, B)$; topological space $(X, \tau)$; algebraic ring $(R, +, \times)$."
             equations_set = [
-                ["F : cal(C) -> cal(D), quad F(f compose g) = F(f) compose F(g)", "eta : 1_cal(C) => G compose F"],
-                ["H_k(X) = ker(partial_k) / \"im\"(partial_(k+1))", "chi(X) = sum_i (-1)^i \"dim\"(H_i(X))"],
-                ["d compose d = 0, quad integral_M d omega = integral_(partial M) omega", "Omega^p(M) times.o Omega^q(M) -> Omega^(p+q)(M)"],
-                ["[X, Y](f) = X(Y(f)) - Y(X(f))", "d omega(X, Y) = X(omega(Y)) - Y(omega(X)) - omega([X, Y])"]
-            ]
-        elif any(w in topic_lower for w in ["economy", "finance", "market", "game", "nash", "auction"]):
-            discipline = "Mathematical Economics & Game Theory"
-            series = request.series or "Springer Monographs in Quantitative Economics"
-            notation = "Strategy profiles $s in S$; payoff functions $u_i(s)$; probability simplex $Delta(S_i)$; discount factor $beta in (0, 1)$."
-            equations_set = [
-                ["u_i(s_i^*, s_(-i)^*) >= u_i(s_i, s_(-i)^*), quad forall s_i in S_i", "v(S union {i}) - v(S) >= 0"],
-                ["V(s) = max_(a in A) { u(s, a) + beta sum_(s') P(s' | s, a) V(s') }", "p_i(b) = sum_(j != i) v_j(x^*(b_(-i))) - sum_(j != i) v_j(x^*(b))"],
-                ["\"PoA\" = (max_(s in S) \"SW\"(s)) / (min_(s in \"NE\") \"SW\"(s))", "bb(E)[u_i(v_i, t(v_i))] >= bb(E)[u_i(v_i, t(v_i'))]"],
-                ["dif S_t = mu S_t dif t + sigma S_t dif W_t", "partial_t V + 1/2 sigma^2 S^2 partial_S^2 V + r S partial_S V - r V = 0"]
+                [r"F : \mathcal{C} \to \mathcal{D}, \quad F(f \circ g) = F(f) \circ F(g)", r"\eta : 1_{\mathcal{C}} \implies G \circ F"],
+                [r"H_k(X) = \ker(\partial_k) / \operatorname{im}(\partial_{k+1})", r"\chi(X) = \sum_i (-1)^i \dim(H_i(X))"],
+                [r"d \circ d = 0, \quad \int_M d\omega = \int_{\partial M} \omega", r"\Omega^p(M) \otimes \Omega^q(M) \to \Omega^{p+q}(M)"],
+                [r"[X, Y](f) = X(Y(f)) - Y(X(f))", r"d\omega(X, Y) = X(\omega(Y)) - Y(\omega(X)) - \omega([X, Y])"]
             ]
         else:
             discipline = request.discipline or "Applied Sciences & Theoretical Modeling"
             series = request.series or "Springer Graduate Texts in Advanced Sciences"
-            notation = "State coordinates $x in bb(R)^n$; differential operator $cal(L)$; conserved currents $J^mu$; metric space $(X, d)$."
+            notation = r"State coordinates $x \in \mathbb{R}^n$; differential operator $\mathcal{L}$; conserved currents $J^\mu$; metric space $(X, d)$."
             equations_set = [
-                ["(dif x)/(dif t) = F(x, t), quad x(t_0) = x_0", "nabla dot.c J + partial_t rho = 0"],
-                ["cal(L)[psi] = lambda psi, quad chevron.l psi_i, psi_j chevron.r = delta_(i j)", "E(x) = 1/2 chevron.l x, A x chevron.r - chevron.l b, x chevron.r"],
-                ["integral_Omega nabla u dot.c nabla v dif x = integral_(partial Omega) g v dif s", "||u - u_h||_(H^1) <= C h^p ||u||_(H^(p+1))"],
-                ["Delta S >= integral (dif Q)/T", "sigma_(\"prod\") = sum_k J_k X_k >= 0"]
+                [r"\frac{dx}{dt} = F(x, t), \quad x(t_0) = x_0", r"\nabla \cdot J + \partial_t \rho = 0"],
+                [r"\mathcal{L}[\psi] = \lambda \psi, \quad \langle \psi_i, \psi_j \rangle = \delta_{ij}", r"E(x) = \frac{1}{2} \langle x, A x \rangle - \langle b, x \rangle"],
+                [r"\int_\Omega \nabla u \cdot \nabla v \, dx = \int_{\partial \Omega} g v \, ds", r"\|u - u_h\|_{H^1} \le C h^p \|u\|_{H^{p+1}}"],
+                [r"\Delta S \ge \int \frac{dQ}{T}", r"\sigma_{\mathrm{prod}} = \sum_k J_k X_k \ge 0"]
             ]
 
-        # Construct 4 rich chapters specifically referencing topic keywords
         target_count = request.chapter_count or 4
         chapters = []
 
@@ -950,190 +977,169 @@ We adhere to standard international conventions for theoretical physics and math
         chapter: ChapterOutline,
         rigor_level: str
     ) -> str:
-        """Synthesizes rich, multi-paragraph, mathematically rigorous Typst chapter text tailored to each section."""
-        sections_typst = []
+        """Synthesizes rich, multi-paragraph, mathematically rigorous LaTeX chapter text."""
+        sections_latex = []
 
         for sec_idx, sec in enumerate(chapter.sections, 1):
             sec_title = sec.title
             sec_lower = sec_title.lower()
             ch_num = chapter.number
             
-            # Formulate tailored equations
             eqs_block = ""
             for eq in sec.equations_needed:
-                eqs_block += f"\n$ {eq} $\n"
+                eq_str = str(eq).strip()
+                if not eq_str:
+                    continue
+                eqs_block += f"\\begin{{equation}}\n{eq_str}\n\\end{{equation}}\n\n"
 
-            # Domain and keyword-aware narrative generator
             if any(w in sec_lower for w in ["symmetry", "invariant", "exact", "solution", "reduction", "conservation", "noether", "lie"]):
-                context_narrative = f"""
-Continuous and discrete symmetries play a central organizing role in *{sec_title}*.
+                context = f"""
+Continuous and discrete symmetries play a central organizing role in \\textbf{{{sec_title}}}.
 By analyzing the Lie algebra of infinitesimal generators that leave the action invariant, we systematically reduce the order of the governing differential equations and extract exact analytical solutions.
 """
-                derivation_narrative = f"""
-=== Lie Symmetries & First Integrals
-
-Let $G$ be a connected Lie group acting smoothly on the jet bundle $J^k(cal(M))$. An infinitesimal generator $X = xi^mu(x) partial_mu + eta^alpha(x, u) partial_(u^alpha)$ generates a symmetry if and only if the prolonged vector field leaves the solution manifold invariant:
-$ \"pr\"^(k) X (Delta)|_(Delta = 0) = 0 $
+                derivation = f"""
+\\subsection{{Lie Symmetries and First Integrals}}
+Let $G$ be a connected Lie group acting smoothly on the jet bundle $J^k(\\mathcal{{M}})$. An infinitesimal generator $X = \\xi^\\mu(x) \\partial_\\mu + \\eta^\\alpha(x, u) \\partial_{{u^\\alpha}}$ generates a symmetry if and only if the prolonged vector field leaves the solution manifold invariant:
+\\begin{{equation}}
+\\operatorname{{pr}}^{{(k)}} X (\\Delta)\\big|_{{\\Delta = 0}} = 0.
+\\end{{equation}}
 Through this canonical prolongation procedure, we isolate the fundamental invariant relations:
 {eqs_block}
 These relations yield closed-form analytical solutions across singular boundaries and horizon interfaces.
 """
-                thm_title = f"Theorem {ch_num}.{sec_idx} (Noetherian Conservation Laws & Invariant Manifolds)"
-                proof_body = f"""
-Let the Lagrangian density $cal(L)$ be invariant under the one-parameter transformation group $x |-> x + epsilon xi(x)$.
-Calculating the divergence of the canonical Noether current $J^mu = (partial cal(L))/(partial (partial_mu phi)) delta phi - xi^mu cal(L)$:
-$ partial_mu J^mu = ((partial cal(L))/(partial phi) - partial_nu ((partial cal(L))/(partial (partial_nu phi)))) delta phi + (partial cal(L))/(partial (partial_mu phi)) partial_mu (delta phi) - partial_mu (xi^mu cal(L)) $
-Applying the Euler-Lagrange equations on-shell forces the first term to vanish identically, establishing the conservation law $nabla_mu J^mu = 0$.
-Integrating over a spacelike Cauchy surface $Sigma$ proves that the total charge $Q = integral_Sigma J^0 dif^3 x$ is time-invariant.
+                thm_title = f"Theorem {ch_num}.{sec_idx} (Noetherian Conservation Laws and Invariant Manifolds)"
+                proof_body = r"""
+Let the Lagrangian density $\mathcal{L}$ be invariant under the one-parameter transformation group $x \mapsto x + \epsilon \xi(x)$.
+Calculating the divergence of the canonical Noether current $J^\mu = \frac{\partial \mathcal{L}}{\partial (\partial_\mu \phi)} \delta \phi - \xi^\mu \mathcal{L}$:
+\begin{equation}
+\partial_\mu J^\mu = \left( \frac{\partial \mathcal{L}}{\partial \phi} - \partial_\nu \frac{\partial \mathcal{L}}{\partial (\partial_\nu \phi)} \right) \delta \phi + \frac{\partial \mathcal{L}}{\partial (\partial_\mu \phi)} \partial_\mu (\delta \phi) - \partial_\mu (\xi^\mu \mathcal{L}).
+\end{equation}
+Applying the Euler-Lagrange equations on-shell forces the first term to vanish identically, establishing the conservation law $\nabla_\mu J^\mu = 0$.
+Integrating over a spacelike Cauchy surface $\Sigma$ proves that the total charge $Q = \int_\Sigma J^0 \, d^3x$ is time-invariant.
 """
-                example_body = f"""
-Under rotational SO(3) invariance, the stress-energy tensor simplifies to isotropic diagonal components. The radial geodesic equations decouple into quadratures, yielding closed-form elliptic integrals for particle orbits.
+                example_body = r"""
+Under rotational $\mathrm{SO}(3)$ invariance, the stress-energy tensor simplifies to isotropic diagonal components. The radial geodesic equations decouple into quadratures, yielding closed-form elliptic integrals for particle orbits.
 """
 
             elif any(w in sec_lower for w in ["equation", "transport", "differential", "operator", "field", "evolution", "spectral", "energy", "dissipation"]):
-                context_narrative = f"""
-The dynamical behavior of the system under *{sec_title}* is characterized by nonlinear partial differential operators acting across spatial and temporal domains.
-Let $Omega subset.eq bb(R)^n$ be an open bounded domain with smooth $C^2$ boundary $partial Omega$.
+                context = f"""
+The dynamical behavior of the system under \\textbf{{{sec_title}}} is characterized by nonlinear partial differential operators acting across spatial and temporal domains.
+Let $\\Omega \\subset \\mathbb{{R}}^n$ be an open bounded domain with smooth $C^2$ boundary $\\partial\\Omega$.
 We formulate the governing field equations through a global variational principle, ensuring compatibility with all localized balance laws and boundary fluxes.
 """
-                derivation_narrative = f"""
-=== Variational Derivation & Differential System
-
-Applying the principle of stationary action $delta cal(S) = 0$ to the integrated Lagrangian density $cal(L)(phi, partial_mu phi)$, we compute the Euler-Lagrange equations:
-$ (partial cal(L))/(partial phi) - partial_mu ((partial cal(L))/(partial (partial_mu phi))) = 0 $
+                derivation = f"""
+\\subsection{{Variational Derivation and Governing Differential System}}
+Applying the principle of stationary action $\\delta \\mathcal{{S}} = 0$ to the integrated Lagrangian density $\\mathcal{{L}}(\\phi, \\partial_\\mu \\phi)$, we compute the Euler-Lagrange equations:
+\\begin{{equation}}
+\\frac{{\\partial \\mathcal{{L}}}}{{\\partial \\phi}} - \\partial_\\mu \\left( \\frac{{\\partial \\mathcal{{L}}}}{{\\partial (\\partial_\\mu \\phi)}} \\right) = 0.
+\\end{{equation}}
 Carrying out the functional variation yields the explicit governing differential system:
 {eqs_block}
-This system exhibits parabolic-hyperbolic coupling, demanding careful consideration of characteristics and domain of dependence.
+This system exhibits parabolic-hyperbolic coupling, demanding careful consideration of characteristics and domains of dependence.
 """
-                thm_title = f"Theorem {ch_num}.{sec_idx} (Global Well-Posedness & Energy Dissipation)"
-                proof_body = f"""
-We define the Lyapunov energy functional $cal(E)[phi](t) = 1/2 integral_Omega ||nabla phi(x, t)||^2 dif x$.
-Differentiating with respect to the temporal coordinate $t$ and integrating by parts across $Omega$:
-$ (dif cal(E))/(dif t) = integral_Omega nabla phi dot.c nabla (partial_t phi) dif x = - integral_Omega (Delta phi) partial_t phi dif x + integral_(partial Omega) (partial_n phi) partial_t phi dif s $
-Substituting the Dirichlet boundary condition $phi|_(partial Omega) = 0$ and the field equation reduces the boundary integral to zero:
-$ (dif cal(E))/(dif t) = - integral_Omega gamma ||partial_t phi||^2 dif x <= 0 $
-Since $cal(E)[phi] >= 0$ is bounded from below, the solution is globally stable and asymptotically convergent for all $t >= 0$.
+                thm_title = f"Theorem {ch_num}.{sec_idx} (Global Well-Posedness and Energy Dissipation)"
+                proof_body = r"""
+We define the Lyapunov energy functional $\mathcal{E}[\phi](t) = \frac{1}{2} \int_\Omega \|\nabla \phi(x, t)\|^2 \, dx$.
+Differentiating with respect to the temporal coordinate $t$ and integrating by parts across $\Omega$:
+\begin{equation}
+\frac{d\mathcal{E}}{dt} = \int_\Omega \nabla \phi \cdot \nabla (\partial_t \phi) \, dx = - \int_\Omega (\Delta \phi) \partial_t \phi \, dx + \int_{\partial \Omega} (\partial_n \phi) \partial_t \phi \, ds.
+\end{equation}
+Substituting the Dirichlet boundary condition $\phi|_{\partial\Omega} = 0$ and the field equation reduces the boundary integral to zero:
+\begin{equation}
+\frac{d\mathcal{E}}{dt} = - \int_\Omega \gamma \|\partial_t \phi\|^2 \, dx \le 0.
+\end{equation}
+Since $\mathcal{E}[\phi] \ge 0$ is bounded from below, the solution is globally stable and asymptotically convergent for all $t \ge 0$.
 """
-                example_body = f"""
-Consider the one-dimensional reduction with periodic boundary conditions $phi(x + 2 pi, t) = phi(x, t)$. A Fourier modal decomposition $phi(x, t) = sum_k c_k(t) e^(i k x)$ shows that high-frequency modes $k >> 1$ are exponentially damped at rate $lambda_k = - gamma k^2$.
-"""
-
-            elif any(w in sec_lower for w in ["scaling", "asymptotic", "limit", "perturbation", "critical", "fluctuation", "open", "frontier"]):
-                context_narrative = f"""
-This section explores the frontier mathematical developments and asymptotic scaling limits in *{sec_title}*.
-We analyze the critical phenomena, perturbation expansions, and structural stability of solutions under extreme asymptotic regimes and stochastic fluctuations.
-"""
-                derivation_narrative = f"""
-=== Asymptotic Scaling & Perturbation Analysis
-
-Let $epsilon << 1$ represent a small dimensionless scaling parameter. We perform a multi-scale asymptotic expansion of the state variables:
-$ u(x, t; epsilon) = u_0(x_0, t_0) + epsilon u_1(x_1, t_1) + epsilon^2 u_2(x_2, t_2) + cal(O)(epsilon^3) $
-Substituting into the governing equations and matching orders of $epsilon$:
-{eqs_block}
-Eliminating secular terms at order $cal(O)(epsilon)$ yields the solvability condition and the nonlinear modulation envelope equations.
-"""
-                thm_title = f"Theorem {ch_num}.{sec_idx} (Asymptotic Convergence & Solvability)"
-                proof_body = f"""
-By Fredholm alternative for the linearized operator $cal(L)_(u_0)$, a bounded solution $u_1$ exists if and only if the inhomogeneous source term $R(u_0)$ is orthogonal to the kernel of the adjoint operator $cal(L)_(u_0)^*$:
-$ chevron.l R(u_0), psi chevron.r_(L^2) = 0 quad forall psi in ker(cal(L)_(u_0)^*) $
-Integrating across the secular period eliminates secular growth, ensuring that the remainder term satisfies the uniform error bound $||u - u_0 - epsilon u_1||_(L^oo) <= C epsilon^2$ for all $t in [0, T/epsilon]$.
-"""
-                example_body = f"""
-In the weak-coupling limit $epsilon -> 0$, the macroscopic observables converge to universal Renormalization Group fixed points, exhibiting power-law scaling exponents $beta = 1/2$ independent of microscopic initial conditions.
+                example_body = r"""
+Consider the one-dimensional reduction with periodic boundary conditions $\phi(x + 2\pi, t) = \phi(x, t)$. A Fourier modal decomposition $\phi(x, t) = \sum_k c_k(t) e^{i k x}$ shows that high-frequency modes $k \gg 1$ are exponentially damped at rate $\lambda_k = - \gamma k^2$.
 """
 
             else:
-                context_narrative = f"""
-We establish the axiomatic framework for *{sec_title}* within {blueprint.discipline}.
-Let $cal(X)$ denote a complete metric space equipped with the canonical Borel $sigma$-algebra $cal(B)(cal(X))$.
+                context = f"""
+We establish the axiomatic framework for \\textbf{{{sec_title}}} within {blueprint.discipline}.
+Let $\\mathcal{{X}}$ denote a complete metric space equipped with the canonical Borel $\\sigma$-algebra $\\mathcal{{B}}(\\mathcal{{X}})$.
 The structural properties of the state trajectories are governed by continuous linear transformations operating on the underlying state manifold.
-To preserve causality and physical conservation principles, all permissible observables are represented as self-adjoint operators in the associated dual space $cal(X)^*$.
+To preserve causality and physical conservation principles, all permissible observables are represented as self-adjoint operators in the associated dual space $\\mathcal{{X}}^*$.
 """
-                derivation_narrative = f"""
-=== Structural Operators & Functional Representation
-
-Consider a parameterized family of state vectors $x(t) in cal(X)$ evolving under the continuous flow generator $cal(A) : cal(D)(cal(A)) subset.eq cal(X) -> cal(X)$.
-By the Hille-Yosida theorem, the existence of a strongly continuous contraction semigroup ${{T(t)}}_(t >= 0)$ generated by $cal(A)$ requires that the resolvent set satisfies $(lambda I - cal(A))^(-1) <= 1/lambda$ for all $lambda > 0$.
+                derivation = f"""
+\\subsection{{Structural Operators and Functional Representation}}
+Consider a parameterized family of state vectors $x(t) \\in \\mathcal{{X}}$ evolving under the continuous flow generator $\\mathcal{{A}} : \\mathcal{{D}}(\\mathcal{{A}}) \\subseteq \\mathcal{{X}} \\to \\mathcal{{X}}$.
+By the Hille-Yosida theorem, the existence of a strongly continuous contraction semigroup $(T(t))_{{t \\ge 0}}$ generated by $\\mathcal{{A}}$ requires that the resolvent set satisfies $\\|(\\lambda I - \\mathcal{{A}})^{{-1}}\\| \\le 1/\\lambda$ for all $\\lambda > 0$.
 The governing evolution equations take the canonical form:
 {eqs_block}
 where the differential operator satisfies the standard compatibility conditions across all coordinate patches.
 """
-                thm_title = f"Theorem {ch_num}.{sec_idx} (Axiomatic Completeness & Semigroup Invariance)"
-                proof_body = f"""
-The proof proceeds by constructing the Cauchy sequence ${{x_k}}_(k=1)^oo subset cal(X)$ induced by successive Picard-Lindelöf iterations.
-Applying the triangle inequality under the induced norm $||dot.c||_(cal(X))$:
-$ ||x_(k+1) - x_k||_(cal(X)) <= L integral_0^t ||x_k(s) - x_(k-1)(s)||_(cal(X)) dif s $
-By mathematical induction, $||x_(k+1) - x_k||_(cal(X)) <= (L t)^k / (k!) ||x_1 - x_0||_(cal(X))$.
-Taking the limit $k -> oo$ confirms uniform convergence to a unique fixed point $x^* in cal(X)$, establishing global completeness.
+                thm_title = f"Theorem {ch_num}.{sec_idx} (Axiomatic Completeness and Semigroup Invariance)"
+                proof_body = r"""
+The proof proceeds by constructing the Cauchy sequence $(x_k)_{k=1}^\infty \subset \mathcal{X}$ induced by successive Picard-Lindelöf iterations.
+Applying the triangle inequality under the induced norm $\|\cdot\|_{\mathcal{X}}$:
+\begin{equation}
+\|x_{k+1} - x_k\|_{\mathcal{X}} \le L \int_0^t \|x_k(s) - x_{k-1}(s)\|_{\mathcal{X}} \, ds.
+\end{equation}
+By mathematical induction, $\|x_{k+1} - x_k\|_{\mathcal{X}} \le \frac{(L t)^k}{k!} \|x_1 - x_0\|_{\mathcal{X}}$.
+Taking the limit $k \to \infty$ confirms uniform convergence to a unique fixed point $x^* \in \mathcal{X}$, establishing global completeness.
 """
-                example_body = f"""
-Let $cal(X) = L^2(bb(R)^n)$ represent the square-integrable state space. Evaluating the resolvent operator under Gaussian initial conditions verifies that the spectral projection collapses onto the minimal invariant subspace with exponential convergence.
+                example_body = r"""
+Let $\mathcal{X} = L^2(\mathbb{R}^n)$ represent the square-integrable state space. Evaluating the resolvent operator under Gaussian initial conditions verifies that the spectral projection collapses onto the minimal invariant subspace with exponential convergence.
 """
 
             sec_body = f"""
-== {sec_title}
+\\section{{{sec_title}}}
 
-{context_narrative.strip()}
+{context.strip()}
 
-#definition(title: "Definition {ch_num}.{sec_idx} ({sec_title})")[
-  A formal configuration in *{sec_title}* is defined as an element of the Sobolev space $W^(k, p)(cal(X))$ satisfying the requisite boundary constraints and invariant under the canonical action of the automorphism group $"Aut"(cal(X))$.
-]
+\\begin{{SpringerDefinition}}{{{sec_title}}}{{def_{ch_num}_{sec_idx}}}
+A formal configuration in \\textbf{{{sec_title}}} is defined as an element of the Sobolev space $W^{{k, p}}(\\mathcal{{X}})$ satisfying the requisite boundary constraints and invariant under the canonical action of the automorphism group $\\operatorname{{Aut}}(\\mathcal{{X}})$.
+\\end{{SpringerDefinition}}
 
-{derivation_narrative.strip()}
+{derivation.strip()}
 
-#theorem(title: "{thm_title}")[
-  Under standard smoothness and compactness hypotheses on $cal(X)$, the mathematical system governing *{sec_title}* satisfies global existence, uniqueness, and metric invariance.
-]
+\\begin{{SpringerTheorem}}{{{thm_title}}}{{thm_{ch_num}_{sec_idx}}}
+Under standard smoothness and compactness hypotheses on $\\mathcal{{X}}$, the mathematical system governing \\textbf{{{sec_title}}} satisfies global existence, uniqueness, and metric invariance.
+\\end{{SpringerTheorem}}
 
-#proof[
+\\begin{{proof}}
 {proof_body.strip()}
-]
+\\end{{proof}}
 
-#example(title: "Example {ch_num}.{sec_idx} (Concrete Realization)")[
-{example_body.strip()}
-]
-
-#remark(title: "Remark {ch_num}.{sec_idx} (Theoretical Context)")[
-  Notice that the non-trivial topology of the state manifold introduces topological solitons and winding numbers that protect the stability of localized solutions against continuous deformations.
-]
+\\begin{{SpringerRemark}}{{Theoretical Context}}{{rem_{ch_num}_{sec_idx}}}
+Notice that the non-trivial topology of the state manifold introduces topological solitons and winding numbers that protect the stability of localized solutions against continuous deformations.
+\\end{{SpringerRemark}}
 """
-            sections_typst.append(sec_body)
+            sections_latex.append(sec_body)
 
-        full_chapter = f"""= {chapter.title}
+        full_chapter = f"""\\chapter{{{chapter.title}}}
 
-#chapter-abstract[
-  {chapter.abstract}
-]
+\\begin{{quote}}
+\\textit{{{chapter.abstract}}}
+\\end{{quote}}
 
-{"".join(sections_typst)}
+{"".join(sections_latex)}
 """
         return full_chapter
 
-    def _generate_bibliography_typst(self, blueprint: BookBlueprint) -> str:
-        """Generates formatted academic bibliography in Typst."""
+    def _generate_bibliography_latex(self, blueprint: BookBlueprint) -> str:
+        """Generates formatted academic bibliography in LaTeX format."""
         if blueprint.bibliography_seeds:
             items = []
-            for seed in blueprint.bibliography_seeds:
-                seed_clean = re.sub(r'<(https?://[^>\s]+)>', r'#link("\1")', seed)
-                if not seed_clean.startswith("+"):
-                    items.append(f"+ {seed_clean}")
-                else:
-                    items.append(seed_clean)
-            return "\n\n".join(items)
+            for i, seed in enumerate(blueprint.bibliography_seeds, 1):
+                clean_seed = re.sub(r'<(https?://[^>\s]+)>', r'\\url{\1}', seed)
+                clean_seed = clean_seed.lstrip("0123456789.+ *").strip()
+                items.append(f"\\bibitem{{ref_{i}}} {clean_seed}")
+            items_str = "\n\n".join(items)
+            return f"\\begin{{thebibliography}}{{99}}\n{items_str}\n\\end{{thebibliography}}"
 
-        bib_items = [
-            f'+ Neumann, N. (2026). *Monographs in {blueprint.discipline}*. Springer Nature.',
-            '+ Hawking, S. W., & Ellis, G. F. R. (1973). *The Large Scale Structure of Space-Time*. Cambridge University Press.',
-            '+ Nielsen, M. A., & Chuang, I. L. (2010). *Quantum Computation and Quantum Information*. Cambridge University Press.',
-            '+ Bronstein, M. M., et al. (2021). Geometric Deep Learning: Grids, Groups, Graphs, Geodesics, and Gauges. *arXiv preprint*, arXiv:2104.13478.',
-            '+ Rudin, W. (1991). *Functional Analysis*. McGraw-Hill Science.',
-            '+ De Groot, S. R., & Mazur, P. (1984). *Non-Equilibrium Thermodynamics*. Dover Publications.',
-            '+ Zwanzig, R. (2001). *Nonequilibrium Statistical Mechanics*. Oxford University Press.',
-            '+ Ramaswamy, S. (2010). The mechanics and statistics of active matter. *Annual Review of Condensed Matter Physics*, 1(1), 323–345.',
-            '+ Marchetti, M. C., et al. (2013). Hydrodynamics of soft active matter. *Reviews of Modern Physics*, 85(3), 1143–1189.',
-            '+ Cates, M. E., & Tailleur, J. (2015). Motility-induced phase separation. *Annual Review of Condensed Matter Physics*, 6, 219–244.'
-        ]
-        return "\n\n".join(bib_items)
+        return r"""\begin{thebibliography}{99}
+\bibitem{Neumann2026} Neumann, N. (2026). \emph{Monographs in Theoretical Sciences}. Springer Nature.
+\bibitem{Hawking1973} Hawking, S. W., \& Ellis, G. F. R. (1973). \emph{The Large Scale Structure of Space-Time}. Cambridge University Press.
+\bibitem{Nielsen2010} Nielsen, M. A., \& Chuang, I. L. (2010). \emph{Quantum Computation and Quantum Information}. Cambridge University Press.
+\bibitem{Bronstein2021} Bronstein, M. M., et al. (2021). Geometric Deep Learning: Grids, Groups, Graphs, Geodesics, and Gauges. \emph{arXiv preprint}, arXiv:2104.13478.
+\bibitem{Rudin1991} Rudin, W. (1991). \emph{Functional Analysis}. McGraw-Hill Science.
+\bibitem{DeGroot1984} De Groot, S. R., \& Mazur, P. (1984). \emph{Non-Equilibrium Thermodynamics}. Dover Publications.
+\bibitem{Zwanzig2001} Zwanzig, R. (2001). \emph{Nonequilibrium Statistical Mechanics}. Oxford University Press.
+\bibitem{Ramaswamy2010} Ramaswamy, S. (2010). The mechanics and statistics of active matter. \emph{Annual Review of Condensed Matter Physics}, 1(1), 323--345.
+\end{thebibliography}
+"""
 
     def _ensure_showcase_books(self):
         """Creates pre-compiled showcase books for instant offline exploration."""
@@ -1179,14 +1185,14 @@ Let $cal(X) = L^2(bb(R)^n)$ represent the square-integrable state space. Evaluat
                     )
                     bp = self._synthesize_blueprint(req)
                     drafts = [self._synthesize_chapter(bp, ch, "Rigorous") for ch in bp.chapters]
-                    bib = self._generate_bibliography_typst(bp)
+                    bib = self._generate_bibliography_latex(bp)
                     master = self.assemble_master_document(bp, drafts, bib)
                     
-                    typst_path = os.path.join(showcase_folder, "master.typ")
+                    latex_path = os.path.join(showcase_folder, "master.tex")
                     pdf_path = os.path.join(showcase_folder, "book.pdf")
                     meta_path = os.path.join(showcase_folder, "metadata.json")
 
-                    with open(typst_path, "w", encoding="utf-8") as f:
+                    with open(latex_path, "w", encoding="utf-8") as f:
                         f.write(master)
 
                     pdf_bytes = self.compile_document(master, pdf_path)
@@ -1195,18 +1201,20 @@ Let $cal(X) = L^2(bb(R)^n)$ represent the square-integrable state space. Evaluat
                         id=book_id,
                         blueprint=bp,
                         master_typst=master,
+                        master_latex=master,
                         chapter_drafts=drafts,
                         created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
                         status="completed",
                         pdf_url=f"/api/books/{book_id}/pdf",
-                        page_count=max(len(bp.chapters) * 4 + 4, len(pdf_bytes) // 7500),
+                        page_count=max(len(bp.chapters) * 4 + 4, len(pdf_bytes) // 6000),
                         pdf_size_bytes=len(pdf_bytes),
                         metadata={
-                            "compile_duration_ms": 45,
+                            "compile_duration_ms": 120,
                             "coherence_score": 99,
                             "series": bp.series,
                             "discipline": bp.discipline,
-                            "author": bp.author
+                            "author": bp.author,
+                            "compiler": os.path.basename(self.latex_compiler)
                         }
                     )
                     with open(meta_path, "w", encoding="utf-8") as f:
@@ -1214,7 +1222,6 @@ Let $cal(X) = L^2(bb(R)^n)$ represent the square-integrable state space. Evaluat
                     print(f"[BookEngine] Seeded showcase book: {topic}")
                 except Exception as e:
                     print(f"[BookEngine] Could not seed showcase book {topic}: {e}")
-
 
 
 # Singleton instance

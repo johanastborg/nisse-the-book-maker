@@ -77,7 +77,7 @@ export const Navbar: React.FC<NavbarProps> = ({ onOpenSettings, bookCount = 0 })
           {/* Engine status indicator */}
           <div className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900/90 border border-slate-800 text-[11px] text-slate-300">
             <Cpu className="h-3 w-3 text-emerald-400 animate-pulse" />
-            <span>Typst 0.15</span>
+            <span>LaTeX Engine</span>
             <span className="text-slate-600">|</span>
             <span className="text-amber-400/90">Gemini 2.5</span>
           </div>

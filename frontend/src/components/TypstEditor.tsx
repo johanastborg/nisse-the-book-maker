@@ -40,7 +40,7 @@ export const TypstEditor: React.FC<TypstEditorProps> = ({
       setLastCompileMs(compileTime);
       onRecompiled?.(source, compileTime);
     } catch (err: any) {
-      setErrorMsg(err.message || 'Typst compilation failed');
+      setErrorMsg(err.message || 'LaTeX compilation failed');
     } finally {
       setIsCompiling(false);
     }
@@ -53,7 +53,7 @@ export const TypstEditor: React.FC<TypstEditorProps> = ({
   };
 
   const handleReset = () => {
-    if (confirm('Reset Typst source code to initial generated version?')) {
+    if (confirm('Reset LaTeX source code to initial generated version?')) {
       setSource(initialSource);
     }
   };
@@ -67,9 +67,9 @@ export const TypstEditor: React.FC<TypstEditorProps> = ({
             <FileCode2 className="h-4 w-4" />
           </div>
           <div>
-            <span className="font-semibold text-slate-200">master.typ</span>
+            <span className="font-semibold text-slate-200">master.tex</span>
             <span className="text-[10px] text-slate-500 ml-2 font-mono">
-              Typst Markup & Math Equations
+              Springer LaTeX Preamble & Equations
             </span>
           </div>
         </div>
@@ -93,9 +93,9 @@ export const TypstEditor: React.FC<TypstEditorProps> = ({
 
           <a
             href={getTypstUrl(bookId)}
-            download={`${bookId}_master.typ`}
+            download={`${bookId}_master.tex`}
             className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-300 hover:text-white transition-colors"
-            title="Download .typ source"
+            title="Download .tex source"
           >
             <Download className="h-3.5 w-3.5" />
           </a>

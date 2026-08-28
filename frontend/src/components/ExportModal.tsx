@@ -94,10 +94,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
             <Download className="h-4 w-4 text-amber-400 group-hover:translate-y-0.5 transition-transform" />
           </a>
 
-          {/* 2. Typst Master Source */}
+          {/* 2. LaTeX Master Source */}
           <a
             href={getTypstUrl(book.id)}
-            download={`${book.id}_master.typ`}
+            download={`${book.id}_master.tex`}
             className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 hover:border-amber-500/50 flex items-center justify-between group transition-all"
           >
             <div className="flex items-center gap-3">
@@ -106,10 +106,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               </div>
               <div>
                 <div className="text-xs font-bold text-slate-200 group-hover:text-amber-300 transition-colors">
-                  Typst Master Project Source (.typ)
+                  LaTeX Master Project Source (.tex)
                 </div>
                 <div className="text-[11px] text-slate-500">
-                  Compiles instantly with Typst CLI (`typst compile master.typ`)
+                  Compiles directly with `lualatex`, `xelatex`, or `tectonic`
                 </div>
               </div>
             </div>

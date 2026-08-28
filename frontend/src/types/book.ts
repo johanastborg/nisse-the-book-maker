@@ -63,6 +63,7 @@ export interface BookDetail {
   id: string;
   blueprint: BookBlueprint;
   master_typst: string;
+  master_latex?: string;
   chapter_drafts: string[];
   created_at: string;
   status: string;

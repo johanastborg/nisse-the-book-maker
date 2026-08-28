@@ -50,22 +50,22 @@ export const AgentPipelineVisualizer: React.FC<AgentPipelineVisualizerProps> = (
       id: 2,
       name: 'Writer Agents',
       icon: PenTool,
-      model: 'Gemini 2.5 Pro (Parallel)',
-      desc: 'Concurrent Mathematical Derivations & Typst Markup',
+      model: 'Gemini 2.5 Flash (Parallel)',
+      desc: 'Concurrent Mathematical Derivations & LaTeX Markup',
     },
     {
       id: 3,
       name: 'Reviewer Agent',
       icon: CheckCircle2,
-      model: 'Gemini 2.5 Pro',
-      desc: 'Notation Unification & Springer Bibliography',
+      model: 'Gemini 2.5 Flash',
+      desc: 'Notation Unification & Springer LaTeX Bibliography',
     },
     {
       id: 4,
-      name: 'Typst Compiler',
+      name: 'LaTeX Engine',
       icon: FileCode2,
-      model: 'Typst 0.15 Engine',
-      desc: 'Sub-second Deterministic Publication PDF Typesetting',
+      model: 'LuaLaTeX / Tectonic',
+      desc: 'Deterministic Springer Monograph PDF Typesetting',
     },
   ];
 
@@ -160,7 +160,7 @@ export const AgentPipelineVisualizer: React.FC<AgentPipelineVisualizerProps> = (
               )}
               {compileMs !== undefined && (
                 <div className="px-2.5 py-1 rounded-lg bg-amber-500/10 text-amber-400 border border-amber-500/30">
-                  Typst: {compileMs}ms
+                  LaTeX: {compileMs}ms
                 </div>
               )}
             </div>
@@ -202,7 +202,7 @@ export const AgentPipelineVisualizer: React.FC<AgentPipelineVisualizerProps> = (
                         ) : isWriting ? (
                           <span className="text-amber-400 animate-pulse flex items-center gap-1">
                             <div className="h-2 w-2 rounded-full bg-amber-400 animate-ping" />
-                            Writing Typst Math...
+                            Writing LaTeX Math...
                           </span>
                         ) : (
                           <span className="text-slate-600">Queued</span>

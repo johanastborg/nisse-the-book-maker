@@ -29,7 +29,7 @@ async def root():
     return {
         "status": "online",
         "service": "Nisse Academic Book Maker",
-        "engine": "Typst 0.15.0 + Gemini Multi-Agent Pipeline",
+        "engine": f"LaTeX Compiler ({os.path.basename(engine.latex_compiler)}) + Gemini Multi-Agent Pipeline",
         "version": "1.0.0"
     }
 
@@ -107,7 +107,7 @@ async def list_books():
 
 @app.get("/api/books/{book_id}", response_model=BookDetail)
 async def get_book(book_id: str):
-    """Returns full details of a specific book including master Typst source."""
+    """Returns full details of a specific book including master LaTeX source."""
     book = engine.get_book(book_id)
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
@@ -127,27 +127,47 @@ async def get_book_pdf(book_id: str):
     )
 
 
+@app.get("/api/books/{book_id}/latex")
+async def get_book_latex(book_id: str):
+    """Downloads raw master LaTeX source code."""
+    tex_path = os.path.join(STORAGE_DIR, book_id, "master.tex")
+    if not os.path.exists(tex_path):
+        tex_path = os.path.join(STORAGE_DIR, book_id, "master.typ")
+    if not os.path.exists(tex_path):
+        raise HTTPException(status_code=404, detail="Source not found for this book")
+    return FileResponse(
+        tex_path,
+        media_type="text/plain",
+        filename=f"{book_id}.tex"
+    )
+
+
 @app.get("/api/books/{book_id}/typst")
 async def get_book_typst(book_id: str):
-    """Downloads raw master Typst source code."""
-    typ_path = os.path.join(STORAGE_DIR, book_id, "master.typ")
-    if not os.path.exists(typ_path):
-        raise HTTPException(status_code=404, detail="Typst source not found for this book")
+    """Downloads source code (legacy typst or LaTeX)."""
+    tex_path = os.path.join(STORAGE_DIR, book_id, "master.tex")
+    if not os.path.exists(tex_path):
+        tex_path = os.path.join(STORAGE_DIR, book_id, "master.typ")
+    if not os.path.exists(tex_path):
+        raise HTTPException(status_code=404, detail="Source not found for this book")
     return FileResponse(
-        typ_path,
+        tex_path,
         media_type="text/plain",
-        filename=f"{book_id}.typ"
+        filename=os.path.basename(tex_path)
     )
 
 
 @app.post("/api/books/{book_id}/recompile", response_model=BookDetail)
 async def recompile_book(book_id: str, req: RecompileRequest):
-    """Live re-compiles updated Typst source code in sub-seconds."""
+    """Live re-compiles updated LaTeX source code."""
     try:
-        updated_book = engine.recompile_book(book_id, req.typst_source)
+        source = req.latex_source or req.typst_source
+        if not source:
+            raise HTTPException(status_code=400, detail="No source code provided for recompilation")
+        updated_book = engine.recompile_book(book_id, source)
         return updated_book
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Typst compilation error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"LaTeX compilation error: {str(e)}")
 
 
 @app.delete("/api/books/{book_id}")
